@@ -31,7 +31,6 @@
   12.docker push images  推送镜像到仓库
 
 
-
   ```javascript
   // 一个基本的前端基于nginx镜像的dockerfile
   # 首先，我们需要一个Node环境来构建我们的前端项目
@@ -64,4 +63,12 @@
   # 启动Nginx
   CMD ["nginx", "-g", "daemon off;"]
   ```
+
+  WORKDIR /usr/share/nginx/html
+  RUN rm -f *
+  COPY --from=build /tmp/dist .
+  WORKDIR指定工作目录后，后面的命令都是基于这个目录，比如RUN rm -f * 表示删除/usr/share/nginx/html目录下的所有东西，COPY --from=build /tmp/dist .再把/tmp/dist拷贝到/usr/share/nginx/html中
+
+  dockerfile命令中ADD和COPY的区别，ADD可以跟url，例如：ADD http://address /user/bin/app,他会下载address的内容并且拷贝到app目录下。第二ADD可以自动解压，例如： ADD ./src.zip /user/app，他会先解压src再拷贝到app目录下
+
   
