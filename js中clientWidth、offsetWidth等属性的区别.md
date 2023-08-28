@@ -102,3 +102,5 @@ width/height： 为盒子宽高（content-box和border-box有区别）
 x/y = left/top： 表示矩形左上角相对于**浏览器视口**的坐标位置
 
 bottom/right： 相当于矩形右下角对于**浏览器视口**的坐标位置
+
+我们可以根据这个rect属性配合window.scrollX/window.scrollY计算出dom相对于文档页面的位置信息
