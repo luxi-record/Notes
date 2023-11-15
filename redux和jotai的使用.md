@@ -32,5 +32,6 @@
 2. jotai它是一种原子化的思想，随处可创建。但是useAtom时候需要在react组件中
 3. react-redux是基于Provide实现的，当Provide的store更新后会导致所有子组件的卸载和渲染，即便是这个组件没订阅这个状态，这回造成性能消耗
 4. react-redux偏向于集中管理，创建store有一套规范的要求
+
 使用考虑：
 看个人喜好，jotai更灵活方便，redux更集中。
