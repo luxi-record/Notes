@@ -135,7 +135,12 @@
              rotate = 1
              break
          }
-     }
+     }  
      ```
-  
+   6.fetch可以实现SSE打字机效果，也就是读取response流，也可以通过 const eventSource = new EventSource('http_api_url', { withCredentials: true }) 监听message事件来实现SSE
+  eventSource.addEventListener('message', function(event) {console.log('Received message: ' + event.data);})，可以通过close方法在客户端关闭
+  SSE效果需要server端把响应头设置为：
+  Content-Type: text/event-stream
+  Cache-Control: no-cache
+  Connection: keep-alive
      **总结：xhr功能更全更具体，兼容性也更好，但是使用起来很麻烦各种回调方法。fetch是基于Promise的封装使用起来更简便对于大文件数据的下载fetch更适合，但是功能没xhr全面兼容性也没xhr强。**
