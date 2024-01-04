@@ -57,4 +57,8 @@
    }
    // 这样log可以打印任何类型，不用为每一种类型单独定义
    // log<string>('name') log<number>(2)
+   // 还可以指定多个泛型
+   function log<T,R>(val: T, val2: R): T | R {
+      return val || val2
+   }
    ```
