@@ -50,7 +50,7 @@
    ```
 
 4. //@ts-ignore 表示不对下一行代码进行类型检查
-5. 泛型是指没有固定类型例如
+5. 泛型是指没有固定类型，在调用时候传入确定的类型
    ```javascript
    function log<T>(val: T): T {
       return val
