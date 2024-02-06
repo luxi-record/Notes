@@ -15,6 +15,7 @@
    * 有了虚拟物体，我们就可以把虚拟物体放在我们的虚拟空间中，***scene.add(mesh)***
 
    * ### 我们创建的虚拟的物体都需要通过scene.add()添加到我们的虚拟空间中
+   * ### const axesHelper = new THREE.AxesHelper(150); scene.add(axesHelper)添加开发时候辅助坐标
 
 2. **虚拟相机**
 
