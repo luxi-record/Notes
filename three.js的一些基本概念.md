@@ -8,7 +8,7 @@
 
    * 创建完物体后，我们可以给这个物体添加材质 ***const material = new THREE.MeshBasicMaterial({color: 0xff0000})***，也就是物体的一些外表设置等。three.js提供各种各样的材质（基础网格，漫反射网格，点材质，线材质等）。
 
-   * 基于创建的物体和材质我们可以把两者结合组成一个有材质的虚拟物体，***const mesh  = new THREE.Mesh(box,material)***
+   * 基于创建的物体和**材质**我们可以把两者结合组成一个有材质的虚拟物体，***const mesh  = new THREE.Mesh(box,material)***
 
    * 此时我们可以设置这个虚拟物体在虚拟空间的位置等属性，***mesh.position.set(x,y,z)***
 
@@ -32,3 +32,7 @@
    * 有了要观察到物体和相机，此时我们就可以绘制我们的观察结果。***renderer.render(scene,camera)***，render会绘制结果，然后生成一个canvas画布在其domElement属性上。我们可以通过***renderer.setSize(width, height)***设置画布大小，**通常就是在创建相机时候设置的宽高比来的**
    * 得到绘制结果了我们就可以把画布展示在我们的页面上。***document.body.appendChild(renderer.domElement)***
 
+4. **光源**
+
+   * 光源对我们创建的虚拟物体有着很大的影响，但是不同的**材质**受到的影响也不一样，**MeshBasicMaterial 基础材质不受光源影响**，受影响的有漫反射材质***MeshLambertMaterial***，高光材质，物理材质等。在three.js中有不同的光源，包括点光源（模拟成一个发光的点会向四周发散），平行光源（不发散的一组平行线），聚光灯光源（一个点往某个方向发散的光），环境光源等。
+   * ***const pointLight = new THREE.PointLight(0xffffff, 1.0)***（点光源），创建光源时候可以设置光的颜色，光照强度。还可以设置光是否随着距离而衰减，***pointLight.decay = 0.0***，0表示不会。***pointLight.position.set(x, y, z)***设置光在虚拟空间的位置。***scene.add(pointLight)***添加进我们的虚拟空间让它生效。
