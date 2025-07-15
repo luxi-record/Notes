@@ -408,7 +408,7 @@ function createSubscription(store: any, parentSub?: Subscription) {
 }
 ```
 
-#### 4. 什么时候在subscription注册订阅（useSelector）
+### 4. 什么时候在subscription注册订阅（useSelector）
 
 #### 当我们在组件里面执行useSelector时候其实就是往subscription上注册回调函数，这个回调函数就是判断当前组件是否需要调度更新，其核心主要是调用react的useSyncExternalStore：
 
@@ -617,8 +617,62 @@ function updateSyncExternalStore<T>(
 }
 
 ```
+### 5.中间件的实现
+#### 中间件其实就是对Store的一个增强，本质就是一个函数，函数接受store的dispatch和getState，函数内部返回另一个函数，返回的这个函数接受一个参数，这个参数就是下一个中间件函数
 
-### 5.整体流程
+```javascript
+function applyMiddleware(
+  ...middlewares: Middleware[]
+): StoreEnhancer<any> {
+  return createStore => (reducer, preloadedState) => {
+    const store = createStore(reducer, preloadedState)
+    let dispatch: Dispatch = () => {
+      throw new Error(
+        'Dispatching while constructing your middleware is not allowed. ' +
+          'Other middleware would not be applied to this dispatch.'
+      )
+    }
+    const middlewareAPI: MiddlewareAPI = {
+      getState: store.getState,
+      dispatch: (action, ...args) => dispatch(action, ...args)
+    }
+    const chain = middlewares.map(middleware => middleware(middlewareAPI))
+    // 可以看到中间件其实就是对dispatch的增强
+    dispatch = compose<typeof dispatch>(...chain)(store.dispatch)
+    return {
+      ...store,
+      dispatch
+    }
+  }
+}
+// 中间件的执行顺序是右边到左，链式串行
+function compose(...funcs: Function[]) {
+  if (funcs.length === 0) {
+    return <T>(arg: T) => arg
+  }
+  if (funcs.length === 1) {
+    return funcs[0]
+  }
+  return funcs.reduce(
+    (a, b) =>
+      (...args: any) =>
+        a(b(...args))
+  )
+}
+// 自定义中间示例
+const thunkMiddleware = (store) => {
+  return (next) => {
+    return (action) => {
+      if (typeof action === 'function') {
+        return action(store.dispatch, store.getState)
+      }
+      return next(action)
+    }
+  }
+}
+```
+
+### 6.整体流程
 
 1. **首先创建一个redux的store状态管理对象，在Provider组件中会创建一个subscription订阅管理对象，把subscription的<u><span style='color: red'>批量执行注册的回调函数的函数<span></u>注册到store状态管理对象里面，当store状态发生改变后会就触发subscription订阅的回调的批量执行。**
 
