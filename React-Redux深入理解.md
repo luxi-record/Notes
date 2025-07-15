@@ -105,7 +105,7 @@ export default WrapApp
 1. **获取当前状态的快照。** *store.getState()*
 2. **订阅状态改变。** *store.subscribe(callback)*
 3. **派发状态更新。 ** *store.dispatch(params: Action)*   **Action: {type: string, payload: any}**
-4. **触发回调，当派发状态更新后会里面执行订阅的函数。**
+4. **触发回调，当派发状态更新后会立马执行订阅的函数。**
 
 ```javascript
 // Store的核心代码
@@ -410,7 +410,7 @@ function createSubscription(store: any, parentSub?: Subscription) {
 
 #### 4. 什么时候在subscription注册订阅（useSelector）
 
-#### 当我们在组件里面执行useSelector时候其实就是往subscription上注册回调函数，其核心主要是调用react的useSyncExternalStore：
+#### 当我们在组件里面执行useSelector时候其实就是往subscription上注册回调函数，这个回调函数就是判断当前组件是否需要调度更新，其核心主要是调用react的useSyncExternalStore：
 
 1. **通过useMemo创建一个优化后的Selector，首先会判断store状态快照发生变化没有，如果快照变化了再判断Selector选择的状态有没有发生改变，如果选择的发生改变了就返回新的值，没有改变就返回之前引用**
 2. **调用react的useSyncExternalStore钩子，把注册订阅的方法以及优化后的Selector给这个钩子**
@@ -419,9 +419,9 @@ function createSubscription(store: any, parentSub?: Subscription) {
 ```javascript
 // useSelector
 const useSelector = () => {
-        // 主要记下入参
+        // 主要看下入参
         const selectedState = useSyncExternalStoreWithSelector(
-            subscription.addNestedSub, // 往subscription注册回调
+            subscription.addNestedSub, // 往subscription注册回调的方法
             store.getState, // 获取store快照
             getServerState || store.getState,
             wrappedSelector, // useSelector的入参，(store) => store.name.value
@@ -469,14 +469,13 @@ function useSyncExternalStoreWithSelector<Snapshot, Selection>(
         memoizedSelection = nextSelection;
         return nextSelection;
       }
-			const prevSnapshot: Snapshot = (memoizedSnapshot: any);
+      const prevSnapshot: Snapshot = (memoizedSnapshot: any);
       const prevSelection: Selection = (memoizedSelection: any);
-
       if (is(prevSnapshot, nextSnapshot)) {
         return prevSelection;
       }
       const nextSelection = selector(nextSnapshot);
-			if (isEqual !== undefined && isEqual(prevSelection, nextSelection)) {
+      if (isEqual !== undefined && isEqual(prevSelection, nextSelection)) {
         return prevSelection;
       }
       memoizedSnapshot = nextSnapshot;
@@ -525,7 +524,6 @@ function mountSyncExternalStore<T>(
     } else {
         nextSnapshot = getSnapshot();
         const root: FiberRoot | null = getWorkInProgressRoot();
-
         if (root === null) {
         }
         if (!includesBlockingLane(root, renderLanes)) {
@@ -538,6 +536,7 @@ function mountSyncExternalStore<T>(
         getSnapshot,
     };
     hook.queue = inst;
+    // 向subscribe注册判断是否需要执行调度更新的函数
     mountEffect(subscribeToStore.bind(null, fiber, inst, subscribe), [subscribe]);
     fiber.flags |= PassiveEffect;
     pushEffect(
@@ -558,6 +557,18 @@ function subscribeToStore(fiber, inst, subscribe) {
     };
     return subscribe(handleStoreChange);
 }
+// 判断当前选择的状态和之前的是否一样
+function checkIfSnapshotChanged(inst) {
+    const latestGetSnapshot = inst.getSnapshot;
+    const prevValue = inst.value;
+    try {
+        const nextValue = latestGetSnapshot();
+        return !is(prevValue, nextValue);
+    } catch (error) {
+        return true;
+    }
+}
+// 执行调度更新
 function forceStoreRerender(fiber) {
     scheduleUpdateOnFiber(fiber, SyncLane, NoTimestamp);
 }
@@ -572,6 +583,7 @@ function updateSyncExternalStore<T>(
     const nextSnapshot = getSnapshot();
     const prevSnapshot = hook.memoizedState;
     const snapshotChanged = !is(prevSnapshot, nextSnapshot);
+    // 判断选择的状态是否改变，改变后就标记需要更新
     if (snapshotChanged) {
         hook.memoizedState = nextSnapshot;
         markWorkInProgressReceivedUpdate();
@@ -594,7 +606,6 @@ function updateSyncExternalStore<T>(
             null,
         );
         const root: FiberRoot | null = getWorkInProgressRoot();
-
         if (root === null) {
           
         }
@@ -607,9 +618,9 @@ function updateSyncExternalStore<T>(
 
 ```
 
-### 5.总结
+### 5.整体流程
 
-1. **首先创建一个redux的store状态管理对象，在Provider组件中会创建一个subscription订阅管理对象，把subscription的批量执行注册的回调函数的函数注册到store状态管理对象里面，当store状态发生改变后会就触发subscription订阅的回调的批量执行。**
+1. **首先创建一个redux的store状态管理对象，在Provider组件中会创建一个subscription订阅管理对象，把subscription的<u><span style='color: red'>批量执行注册的回调函数的函数<span></u>注册到store状态管理对象里面，当store状态发生改变后会就触发subscription订阅的回调的批量执行。**
 
 2. **useSelector会向subscription注册一个回调函数，而这个回调函数的作用是判断当前选择的状态和之前的有没有发生改变，如果发生改变了就会执行react的调度更新**
 
