@@ -678,6 +678,8 @@ const middleware = (store) => (next) => (action) => {
 }
 // 调用中间件时候就相当于是
 compose<typeof dispatch>(...chain)(store.dispatch)(action);
+// 金典的洋葱模型
+compose(f, g, h)(x) = f(g(h(x)));
 ```
 
 ### 6.整体流程
