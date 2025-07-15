@@ -676,6 +676,8 @@ const middleware = (store) => (next) => (action) => {
   // 处理逻辑
   return next(action)
 }
+// 调用中间件时候就相当于是
+compose<typeof dispatch>(...chain)(store.dispatch)(action);
 ```
 
 ### 6.整体流程
