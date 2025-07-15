@@ -671,6 +671,11 @@ const thunkMiddleware = (store) => {
     }
   }
 }
+// 中间件标准结构
+const middleware = (store) => (next) => (action) => {
+  // 处理逻辑
+  return next(action)
+}
 ```
 
 ### 6.整体流程
