@@ -636,6 +636,7 @@ function applyMiddleware(
       getState: store.getState,
       dispatch: (action, ...args) => dispatch(action, ...args)
     }
+    // 为每个中间件提供store的访问能力
     const chain = middlewares.map(middleware => middleware(middlewareAPI))
     // 可以看到中间件其实就是对dispatch的增强
     dispatch = compose<typeof dispatch>(...chain)(store.dispatch)
