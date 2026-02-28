@@ -762,6 +762,143 @@ const AnotherComponent = () => {
 }
 ```
 
+## atomFamily 隔离同一组件多个实例的状态
+
+**作用**：atomFamily 是 Jotai 提供的一个工具函数，用于创建**参数化的 atom 工厂**。它允许你根据不同的参数动态创建和管理多个相互隔离的 atom 实例。
+
+**示例**：
+```typescript
+import { atom, useAtom } from 'jotai';
+import { atomFamily } from 'jotai/utils';
+
+// 创建一个 atomFamily
+const userAtomFamily = atomFamily((userId: string) =>
+  atom({ name: '', age: 0 })
+);
+
+// 使用时传入参数获取对应的 atom
+const userAtom1 = userAtomFamily('user-1'); // 返回 user-1 对应的 atom
+const userAtom2 = userAtomFamily('user-2'); // 返回 user-2 对应的 atom
+// 当页面存在多个组件引用时候如果想要状态隔离的话就可以在父组件定义一个实例id给子组件
+const Component = ({instanceId}) => {
+    const [user, setUser] = useAtom(userAtomFamily(instanceId));
+    return(
+        <div>{user.name}</div>
+    )
+}
+```
+
+**源码解读**：
+
+```javascript
+function atomFamily(initializeAtom, areEqual) {
+  // 自动清理的条件函数
+  let shouldRemove = null;
+  // 核心缓存：Map<Param, [Atom, CreatedAt]>
+  const atoms = new Map();
+  // 事件监听器集合
+  const listeners = new Set();
+
+  // 主函数：根据 param 获取或创建 atom
+  function createAtom(param) {
+    let item;
+
+    // 1. 查找阶段
+    if (areEqual === undefined) {
+      // 无自定义比较函数，直接用 Map.get（O(1) 复杂度）
+      item = atoms.get(param);
+    } else {
+      // 有自定义比较函数，需要遍历查找（O(n) 复杂度）
+      for (const [key, value] of atoms) {
+        if (areEqual(key, param)) {
+          item = value;
+          break;
+        }
+      }
+    }
+
+    // 2. 检查是否命中缓存
+    if (item !== undefined) {
+      // 检查是否需要自动清理
+      if (shouldRemove != null && shouldRemove(item[1], param)) {
+        createAtom.remove(param);
+        // 继续往下创建新的
+      } else {
+        return item[0]; // 返回缓存的 atom
+      }
+    }
+
+    // 3. 未命中，创建新 atom
+    const newAtom = initializeAtom(param);
+    atoms.set(param, [newAtom, Date.now()]);
+
+    // 4. 通知监听器
+    notifyListeners('CREATE', param, newAtom);
+    return newAtom;
+  }
+
+  // 通知所有监听器
+  function notifyListeners(type, param, atom) {
+    for (const listener of listeners) {
+      listener({
+        type,   // 'CREATE' | 'REMOVE'
+        param,
+        atom
+      });
+    }
+  }
+
+  // 添加监听器（实验性 API）
+  createAtom.unstable_listen = function (callback) {
+    listeners.add(callback);
+    return () => {
+      listeners.delete(callback);
+    };
+  };
+
+  // 获取所有已创建的参数
+  createAtom.getParams = function () {
+    return atoms.keys();
+  };
+
+  // 删除指定 param 的 atom
+  createAtom.remove = function (param) {
+    if (areEqual === undefined) {
+      // 无自定义比较函数
+      if (!atoms.has(param)) return;
+      const [atom] = atoms.get(param);
+      atoms.delete(param);
+      notifyListeners('REMOVE', param, atom);
+    } else {
+      // 有自定义比较函数，遍历查找
+      for (const [key, [atom]] of atoms) {
+        if (areEqual(key, param)) {
+          atoms.delete(key);
+          notifyListeners('REMOVE', key, atom);
+          break;
+        }
+      }
+    }
+  };
+
+  // 设置自动清理条件
+  createAtom.setShouldRemove = function (fn) {
+    shouldRemove = fn;
+    if (!shouldRemove) return;
+
+    // 立即检查并清理符合条件的 atom
+    for (const [key, [atom, createdAt]] of atoms) {
+      if (shouldRemove(createdAt, key)) {
+        atoms.delete(key);
+        notifyListeners('REMOVE', key, atom);
+      }
+    }
+  };
+
+  return createAtom;
+}
+```
+
 ## atomWithStorage 创建持久化的状态
 
 **作用**：atomWithStorage允许我们创建一种持久化的原子状态，比如你想持久保存登录用户信息等，如果不指定它的storage，默认就是存储在localStorage中。
