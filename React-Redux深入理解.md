@@ -682,6 +682,623 @@ compose<typeof dispatch>(...chain)(store.dispatch)(action);
 compose(f, g, h)(x) = f(g(h(x)));
 ```
 
+### 5.5 React-Redux 高级使用：自定义 Context Hooks
+
+#### 为什么需要自定义 Context？
+
+默认情况下，`useSelector`、`useDispatch`、`useStore` 使用 React-Redux 内置的 Context。但在以下场景需要隔离：
+
+- **多 Store 架构**：微前端、独立模块需要各自的状态树
+- **状态隔离**：避免不同业务模块的状态互相干扰
+- **测试场景**：单元测试时注入 mock store
+
+React-Redux 提供了三个工厂函数来创建绑定到特定 Context 的 Hooks：
+
+```javascript
+import {
+  createStoreHook,
+  createDispatchHook,
+  createSelectorHook,
+} from 'react-redux';
+```
+
+#### 基础示例：创建独立模块的 Store
+
+```javascript
+import { createContext } from 'react';
+import { Provider } from 'react-redux';
+import {
+  createStoreHook,
+  createDispatchHook,
+  createSelectorHook,
+} from 'react-redux';
+import { configureStore, createSlice } from '@reduxjs/toolkit';
+
+// ====== 1. 创建 Chat 模块的 Slice ======
+const chatSlice = createSlice({
+  name: 'chat',
+  initialState: {
+    currentBotId: null,
+    isAnswering: false,
+    inputValue: '',
+    messages: [],
+  },
+  reducers: {
+    setCurrentBot: (state, action) => {
+      state.currentBotId = action.payload;
+    },
+    setAnswering: (state, action) => {
+      state.isAnswering = action.payload;
+    },
+    setInputValue: (state, action) => {
+      state.inputValue = action.payload;
+    },
+    addMessage: (state, action) => {
+      state.messages.push(action.payload);
+    },
+    clearInput: (state) => {
+      state.inputValue = '';
+    },
+  },
+});
+
+export const chatActions = chatSlice.actions;
+
+// ====== 2. 创建独立的 Store ======
+const chatStore = configureStore({
+  reducer: chatSlice.reducer,
+});
+
+// ====== 3. 创建自定义 Context ======
+const ChatContext = createContext(null);
+
+// ====== 4. 创建绑定到该 Context 的 Hooks ======
+export const useChatStore = createStoreHook(ChatContext);
+export const useChatDispatch = createDispatchHook(ChatContext);
+export const useChatSelector = createSelectorHook(ChatContext);
+
+// ====== 5. 创建 Provider 组件 ======
+export function ChatProvider({ children }) {
+  return (
+    <Provider context={ChatContext} store={chatStore}>
+      {children}
+    </Provider>
+  );
+}
+
+// ====== 6. 在组件中使用 ======
+function ChatInput() {
+  // 使用自定义的 Hooks，只访问 ChatContext 中的 store
+  const inputValue = useChatSelector((state) => state.inputValue);
+  const isAnswering = useChatSelector((state) => state.isAnswering);
+  const dispatch = useChatDispatch();
+
+  const handleChange = (e) => {
+    dispatch(chatActions.setInputValue(e.target.value));
+  };
+
+  const handleSend = () => {
+    dispatch(chatActions.setAnswering(true));
+    // 发送逻辑...
+  };
+
+  return (
+    <div>
+      <input value={inputValue} onChange={handleChange} />
+      <button disabled={isAnswering} onClick={handleSend}>
+        {isAnswering ? 'Sending...' : 'Send'}
+      </button>
+    </div>
+  );
+}
+
+function MessageList() {
+  const messages = useChatSelector((state) => state.messages);
+
+  return (
+    <ul>
+      {messages.map((msg, idx) => (
+        <li key={idx}>{msg.content}</li>
+      ))}
+    </ul>
+  );
+}
+
+// ====== 7. 应用入口 ======
+function App() {
+  return (
+    <ChatProvider>
+      <ChatInput />
+      <MessageList />
+    </ChatProvider>
+  );
+}
+```
+
+#### 进阶示例：多 Store 共存
+
+```javascript
+import React, { createContext } from 'react';
+import { Provider, useSelector, useDispatch } from 'react-redux';
+import {
+  createStoreHook,
+  createDispatchHook,
+  createSelectorHook,
+} from 'react-redux';
+import { configureStore, createSlice } from '@reduxjs/toolkit';
+
+// ==================== 全局 Store ====================
+// 使用默认 Context，不需要创建
+
+const globalSlice = createSlice({
+  name: 'global',
+  initialState: {
+    theme: 'light',
+    language: 'zh-CN',
+    user: null,
+  },
+  reducers: {
+    setTheme: (state, action) => {
+      state.theme = action.payload;
+    },
+    setUser: (state, action) => {
+      state.user = action.payload;
+    },
+  },
+});
+
+const globalStore = configureStore({
+  reducer: globalSlice.reducer,
+});
+
+export const globalActions = globalSlice.actions;
+
+// ==================== Chat 模块 Store ====================
+
+const ChatContext = createContext(null);
+
+const chatSlice = createSlice({
+  name: 'chat',
+  initialState: {
+    currentBotId: null,
+    isAnswering: false,
+    inputValue: '',
+  },
+  reducers: {
+    setCurrentBot: (state, action) => {
+      state.currentBotId = action.payload;
+    },
+    setAnswering: (state, action) => {
+      state.isAnswering = action.payload;
+    },
+    setInputValue: (state, action) => {
+      state.inputValue = action.payload;
+    },
+    clearInput: (state) => {
+      state.inputValue = '';
+    },
+  },
+});
+
+const chatStore = configureStore({
+  reducer: chatSlice.reducer,
+});
+
+export const chatActions = chatSlice.actions;
+export const useChatDispatch = createDispatchHook(ChatContext);
+export const useChatSelector = createSelectorHook(ChatContext);
+
+// ==================== Editor 模块 Store ====================
+
+const EditorContext = createContext(null);
+
+const editorSlice = createSlice({
+  name: 'editor',
+  initialState: {
+    content: '',
+    isModified: false,
+    history: [],
+  },
+  reducers: {
+    setContent: (state, action) => {
+      state.content = action.payload;
+      state.isModified = true;
+    },
+    save: (state) => {
+      state.history.push(state.content);
+      state.isModified = false;
+    },
+    reset: (state) => {
+      state.content = '';
+      state.isModified = false;
+    },
+  },
+});
+
+const editorStore = configureStore({
+  reducer: editorSlice.reducer,
+});
+
+export const editorActions = editorSlice.actions;
+export const useEditorDispatch = createDispatchHook(EditorContext);
+export const useEditorSelector = createSelectorHook(EditorContext);
+
+// ==================== 组件中使用多个 Store ====================
+
+function Header() {
+  // 全局状态（默认 Context）
+  const theme = useSelector((state) => state.theme);
+  const user = useSelector((state) => state.user);
+  const globalDispatch = useDispatch();
+
+  return (
+    <header className={theme}>
+      <span>{user?.name || 'Guest'}</span>
+      <button onClick={() => globalDispatch(globalActions.setTheme(
+        theme === 'light' ? 'dark' : 'light'
+      ))}>
+        Toggle Theme
+      </button>
+    </header>
+  );
+}
+
+function ChatPanel() {
+  // Chat 模块状态
+  const inputValue = useChatSelector((state) => state.inputValue);
+  const isAnswering = useChatSelector((state) => state.isAnswering);
+  const chatDispatch = useChatDispatch();
+
+  // 也可以访问全局状态
+  const theme = useSelector((state) => state.theme);
+
+  return (
+    <div className={`chat-panel ${theme}`}>
+      <input
+        value={inputValue}
+        onChange={(e) => chatDispatch(chatActions.setInputValue(e.target.value))}
+        placeholder="输入消息..."
+      />
+      <button
+        disabled={isAnswering || !inputValue}
+        onClick={() => {
+          chatDispatch(chatActions.setAnswering(true));
+          // 发送后清空
+          setTimeout(() => {
+            chatDispatch(chatActions.clearInput());
+            chatDispatch(chatActions.setAnswering(false));
+          }, 1000);
+        }}
+      >
+        发送
+      </button>
+    </div>
+  );
+}
+
+function EditorPanel() {
+  // Editor 模块状态
+  const content = useEditorSelector((state) => state.content);
+  const isModified = useEditorSelector((state) => state.isModified);
+  const editorDispatch = useEditorDispatch();
+
+  return (
+    <div className="editor-panel">
+      <textarea
+        value={content}
+        onChange={(e) => editorDispatch(editorActions.setContent(e.target.value))}
+      />
+      <div>
+        <button
+          disabled={!isModified}
+          onClick={() => editorDispatch(editorActions.save())}
+        >
+          保存 {isModified && '*'}
+        </button>
+        <button onClick={() => editorDispatch(editorActions.reset())}>
+          重置
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ==================== 多层 Provider 嵌套 ====================
+
+function App() {
+  return (
+    // 全局 Store（默认 Context）
+    <Provider store={globalStore}>
+      {/* Chat 模块 Store */}
+      <Provider context={ChatContext} store={chatStore}>
+        {/* Editor 模块 Store */}
+        <Provider context={EditorContext} store={editorStore}>
+          <div className="app">
+            <Header />
+            <main>
+              <ChatPanel />
+              <EditorPanel />
+            </main>
+          </div>
+        </Provider>
+      </Provider>
+    </Provider>
+  );
+}
+
+export default App;
+```
+
+#### 高级示例：封装可复用的模块化 Store
+
+```javascript
+import React, { createContext, useMemo } from 'react';
+import { Provider } from 'react-redux';
+import {
+  createStoreHook,
+  createDispatchHook,
+  createSelectorHook,
+} from 'react-redux';
+import { configureStore } from '@reduxjs/toolkit';
+
+/**
+ * 创建模块化 Store 的工厂函数
+ * 返回：Context、Hooks、Provider、getStore
+ */
+function createModuleStore(options) {
+  const { name, reducer, middleware = [] } = options;
+
+  // 创建 Context
+  const Context = createContext(null);
+  Context.displayName = `${name}Context`;
+
+  // 创建 Hooks
+  const useModuleStore = createStoreHook(Context);
+  const useModuleDispatch = createDispatchHook(Context);
+  const useModuleSelector = createSelectorHook(Context);
+
+  // Store 引用（用于跨模块通信）
+  let storeRef = null;
+
+  // Provider 组件
+  function ModuleProvider({ children, initialState }) {
+    const store = useMemo(() => {
+      const s = configureStore({
+        reducer,
+        preloadedState: initialState,
+        middleware: (getDefault) => getDefault().concat(middleware),
+        devTools: { name }, // Redux DevTools 中显示的名称
+      });
+      storeRef = s;
+      return s;
+    }, []);
+
+    return (
+      <Provider context={Context} store={store}>
+        {children}
+      </Provider>
+    );
+  }
+
+  return {
+    Context,
+    useStore: useModuleStore,
+    useDispatch: useModuleDispatch,
+    useSelector: useModuleSelector,
+    Provider: ModuleProvider,
+    getStore: () => storeRef,
+  };
+}
+
+// ==================== 使用工厂函数创建模块 ====================
+
+import { createSlice } from '@reduxjs/toolkit';
+
+// Chat 模块
+const chatSlice = createSlice({
+  name: 'chat',
+  initialState: {
+    botId: null,
+    messages: [],
+    input: '',
+  },
+  reducers: {
+    setBotId: (state, action) => { state.botId = action.payload; },
+    setInput: (state, action) => { state.input = action.payload; },
+    addMessage: (state, action) => { state.messages.push(action.payload); },
+    clearMessages: (state) => { state.messages = []; },
+  },
+});
+
+const ChatModule = createModuleStore({
+  name: 'Chat',
+  reducer: chatSlice.reducer,
+});
+
+export const {
+  useSelector: useChatSelector,
+  useDispatch: useChatDispatch,
+  Provider: ChatProvider,
+  getStore: getChatStore,
+} = ChatModule;
+
+export const chatActions = chatSlice.actions;
+
+// Editor 模块
+const editorSlice = createSlice({
+  name: 'editor',
+  initialState: {
+    content: [],
+    selection: null,
+    history: [],
+  },
+  reducers: {
+    setContent: (state, action) => { state.content = action.payload; },
+    setSelection: (state, action) => { state.selection = action.payload; },
+    pushHistory: (state) => { state.history.push([...state.content]); },
+    undo: (state) => {
+      if (state.history.length > 0) {
+        state.content = state.history.pop();
+      }
+    },
+  },
+});
+
+const EditorModule = createModuleStore({
+  name: 'Editor',
+  reducer: editorSlice.reducer,
+});
+
+export const {
+  useSelector: useEditorSelector,
+  useDispatch: useEditorDispatch,
+  Provider: EditorProvider,
+  getStore: getEditorStore,
+} = EditorModule;
+
+export const editorActions = editorSlice.actions;
+
+// ==================== 跨模块通信 ====================
+
+/**
+ * 跨模块操作 Hook
+ * 当需要同时操作多个模块时使用
+ */
+function useCrossModuleActions() {
+  const chatDispatch = useChatDispatch();
+  const editorDispatch = useEditorDispatch();
+
+  return useMemo(() => ({
+    // 发送消息并保存到编辑器
+    sendAndSaveToEditor: async (content) => {
+      // 1. 发送消息
+      chatDispatch(chatActions.addMessage({
+        role: 'user',
+        content
+      }));
+      chatDispatch(chatActions.setInput(''));
+
+      // 2. 模拟 AI 回复
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const aiResponse = `AI Response to: ${content}`;
+
+      chatDispatch(chatActions.addMessage({
+        role: 'assistant',
+        content: aiResponse
+      }));
+
+      // 3. 保存到编辑器
+      editorDispatch(editorActions.pushHistory());
+      editorDispatch(editorActions.setContent([
+        { type: 'paragraph', text: aiResponse }
+      ]));
+    },
+
+    // 清空所有模块状态
+    resetAll: () => {
+      chatDispatch(chatActions.clearMessages());
+      chatDispatch(chatActions.setInput(''));
+      // Editor 的 reset 逻辑...
+    },
+  }), [chatDispatch, editorDispatch]);
+}
+
+// ==================== 完整应用示例 ====================
+
+function ChatInput() {
+  const input = useChatSelector(state => state.input);
+  const dispatch = useChatDispatch();
+  const { sendAndSaveToEditor } = useCrossModuleActions();
+
+  return (
+    <div>
+      <input
+        value={input}
+        onChange={e => dispatch(chatActions.setInput(e.target.value))}
+        onKeyPress={e => {
+          if (e.key === 'Enter' && input) {
+            sendAndSaveToEditor(input);
+          }
+        }}
+      />
+    </div>
+  );
+}
+
+function ChatMessages() {
+  const messages = useChatSelector(state => state.messages);
+
+  return (
+    <div>
+      {messages.map((msg, i) => (
+        <div key={i} className={msg.role}>
+          {msg.content}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Editor() {
+  const content = useEditorSelector(state => state.content);
+  const history = useEditorSelector(state => state.history);
+  const dispatch = useEditorDispatch();
+
+  return (
+    <div>
+      <div className="toolbar">
+        <button
+          disabled={history.length === 0}
+          onClick={() => dispatch(editorActions.undo())}
+        >
+          撤销 ({history.length})
+        </button>
+      </div>
+      <div className="content">
+        {content.map((block, i) => (
+          <p key={i}>{block.text}</p>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <ChatProvider initialState={{ botId: 'bot-1', messages: [], input: '' }}>
+      <EditorProvider initialState={{ content: [], selection: null, history: [] }}>
+        <div className="app">
+          <div className="chat-panel">
+            <ChatMessages />
+            <ChatInput />
+          </div>
+          <div className="editor-panel">
+            <Editor />
+          </div>
+        </div>
+      </EditorProvider>
+    </ChatProvider>
+  );
+}
+
+export default App;
+```
+
+#### 总结
+
+| API | 作用 |
+|-----|------|
+| `createSelectorHook(Context)` | 创建绑定到指定 Context 的 useSelector |
+| `createDispatchHook(Context)` | 创建绑定到指定 Context 的 useDispatch |
+| `createStoreHook(Context)` | 创建绑定到指定 Context 的 useStore |
+
+| 使用场景 | 方案 |
+|----------|------|
+| 单一全局状态 | 使用默认的 useSelector/useDispatch |
+| 多模块独立状态 | 每个模块创建独立 Context + Store |
+| 跨模块通信 | 通过 getStore() 或封装 Cross-Module Hooks |
+| 微前端架构 | 每个子应用使用独立的 Context |
+
 ### 6.整体流程
 
 1. **首先创建一个redux的store状态管理对象，在Provider组件中会创建一个subscription订阅管理对象，把subscription的<u><span style='color: red'>批量执行注册的回调函数的函数<span></u>注册到store状态管理对象里面，当store状态发生改变后会就触发subscription订阅的回调的批量执行。**
@@ -689,4 +1306,3 @@ compose(f, g, h)(x) = f(g(h(x)));
 2. **useSelector会向subscription注册一个回调函数，而这个回调函数的作用是判断当前选择的状态和之前的有没有发生改变，如果发生改变了就会执行react的调度更新**
 
 3. **所以当store更新后就会执行react的调度更新**
-
