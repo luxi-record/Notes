@@ -10,7 +10,31 @@
 ## 目录
 
 - [第一部分：核心数据结构](#第一部分核心数据结构)
+  - [1.1 FiberRoot](#11-fiberroot应用根节点)
+  - [1.2 Fiber](#12-fiberfiber-节点)
+  - [1.3 Hook](#13-hookhook-数据结构)
+  - [1.4 Lane（基础）](#14-lane优先级模型)
+  - [1.5 Lane 优先级系统详解](#15-lane-优先级系统详解)
 - [第二部分：初始化流程（createRoot + render）](#第二部分初始化流程createroot--render)
+  - [2.1 整体流程图](#21-整体流程图)
+  - [2.2 createRoot 详解](#22-createroot-详解)
+  - [2.3 事件系统详解](#23-事件系统详解listentoallsupportedevents)
+    - [2.3.9 JSX 事件属性的存储与获取机制](#239-jsx-事件属性的存储与获取机制)
+    - [2.3.10 useTransition 与事件优先级降级机制](#2310-usetransition-与事件优先级降级机制)
+  - [2.4 createFiberRoot 详解](#24-createfiberroot-详解)
+  - [2.5 createHostRootFiber 详解](#25-createhostrootfiber-详解)
+  - [2.6 render 方法详解](#26-render-方法详解)
+  - [2.7 Diff 算法详解](#27-diff-算法详解reconcilechildren)
+    - [2.7.1 Diff 算法的基本策略](#271-diff-算法的基本策略)
+    - [2.7.2 reconcileChildren 入口](#272-reconcilechildren-入口)
+    - [2.7.3 reconcileChildFibers 核心逻辑](#273-reconcilechildfibers-核心逻辑)
+    - [2.7.4 单节点 Diff](#274-单节点-diffreconcilesinglement)
+    - [2.7.5 多节点 Diff](#275-多节点-diffreconcilechildrenarray)
+    - [2.7.6 节点移动判断](#276-节点移动判断placechild)
+    - [2.7.7 多节点 Diff 完整示例](#277-多节点-diff-完整示例)
+    - [2.7.8 不同类型组件的 Diff 处理](#278-不同类型组件的-diff-处理)
+    - [2.7.9 Diff 算法流程图总结](#279-diff-算法流程图总结)
+    - [2.7.10 Diff 算法的注意事项与最佳实践](#2710-diff-算法的注意事项与最佳实践)
 - [第三部分：更新流程（setState）](#第三部分更新流程setstate)
 - [第四部分：调度机制（Scheduler）](#第四部分调度机制scheduler)
 - [第五部分：完整调用链总结](#第五部分完整调用链总结)
@@ -209,6 +233,359 @@ export const OffscreenLane: Lane =                   0b1000000000000000000000000
 
 **优先级从高到低：** SyncLane > InputContinuousLane > DefaultLane > TransitionLanes > RetryLanes > IdleLane
 
+### 1.5 Lane 优先级系统详解
+
+Lane 是 React 18 中最核心的优先级系统，使用 31 位二进制数（受 JavaScript 31 位有符号整数限制）来表示优先级，**数值越小优先级越高**（位越靠右优先级越高）。
+
+#### 1.5.1 完整的 Lane 常量定义
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberLane.new.js
+
+export type Lanes = number;  // 多个车道的集合（位掩码）
+export type Lane = number;   // 单个车道
+export type LaneMap<T> = Array<T>;  // Lane 到数据的映射数组
+
+export const TotalLanes = 31;  // 总共 31 条车道
+
+export const NoLanes: Lanes = /*                        */ 0b0000000000000000000000000000000;
+export const NoLane: Lane = /*                          */ 0b0000000000000000000000000000000;
+
+// ============ 同步优先级（最高）============
+export const SyncLane: Lane = /*                        */ 0b0000000000000000000000000000001;
+
+// ============ 连续输入优先级 ============
+export const InputContinuousHydrationLane: Lane = /*    */ 0b0000000000000000000000000000010;
+export const InputContinuousLane: Lane = /*             */ 0b0000000000000000000000000000100;
+
+// ============ 默认优先级 ============
+export const DefaultHydrationLane: Lane = /*            */ 0b0000000000000000000000000001000;
+export const DefaultLane: Lane = /*                     */ 0b0000000000000000000000000010000;
+
+// ============ Transition 优先级（共 16 条 lane）============
+const TransitionHydrationLane: Lane = /*                */ 0b0000000000000000000000000100000;
+const TransitionLanes: Lanes = /*                       */ 0b0000000001111111111111111000000;
+const TransitionLane1: Lane = /*                        */ 0b0000000000000000000000001000000;
+const TransitionLane2: Lane = /*                        */ 0b0000000000000000000000010000000;
+// ... TransitionLane3 ~ TransitionLane16
+
+// ============ Retry 优先级（共 5 条 lane）============
+const RetryLanes: Lanes = /*                            */ 0b0000111110000000000000000000000;
+const RetryLane1: Lane = /*                             */ 0b0000000010000000000000000000000;
+// ... RetryLane2 ~ RetryLane5
+
+// ============ 选择性 Hydration ============
+export const SelectiveHydrationLane: Lane = /*          */ 0b0001000000000000000000000000000;
+
+// ============ 空闲优先级（最低）============
+export const IdleHydrationLane: Lane = /*               */ 0b0010000000000000000000000000000;
+export const IdleLane: Lane = /*                        */ 0b0100000000000000000000000000000;
+
+// ============ Offscreen（屏幕外渲染）============
+export const OffscreenLane: Lane = /*                   */ 0b1000000000000000000000000000000;
+```
+
+#### 1.5.2 Lane 位运算操作
+
+Lane 的设计精髓在于使用位运算实现高效的集合操作：
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberLane.new.js
+
+// 合并 lanes（位或操作）
+export function mergeLanes(a: Lanes | Lane, b: Lanes | Lane): Lanes {
+  return a | b;
+}
+
+// 从 set 中移除 subset（位与非操作）
+export function removeLanes(set: Lanes, subset: Lanes | Lane): Lanes {
+  return set & ~subset;
+}
+
+// 取交集（位与操作）
+export function intersectLanes(a: Lanes | Lane, b: Lanes | Lane): Lanes {
+  return a & b;
+}
+
+// 检查是否包含某些 lanes
+export function includesSomeLane(a: Lanes | Lane, b: Lanes | Lane): boolean {
+  return (a & b) !== NoLanes;
+}
+
+// 检查是否是 subset 的子集
+export function isSubsetOfLanes(set: Lanes, subset: Lanes | Lane): boolean {
+  return (set & subset) === subset;
+}
+
+// 获取最高优先级的 Lane（利用补码特性，获取最右边的 1）
+export function getHighestPriorityLane(lanes: Lanes): Lane {
+  return lanes & -lanes;
+}
+```
+
+**`lanes & -lanes` 的原理：**
+```
+假设 lanes = 0b101000
+-lanes = ~lanes + 1 = 0b010111 + 1 = 0b011000
+
+lanes & -lanes = 0b101000 & 0b011000 = 0b001000
+```
+这个技巧利用了二进制补码的特性，能够快速获取最右边的那个 1（即最高优先级的 lane）。
+
+#### 1.5.3 requestUpdateLane - 获取更新的 Lane
+
+当触发更新时，React 会根据触发源决定使用哪个 Lane：
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberWorkLoop.new.js:437
+export function requestUpdateLane(fiber: Fiber): Lane {
+  const mode = fiber.mode;
+
+  // 1. Legacy 模式：总是返回同步 Lane
+  if ((mode & ConcurrentMode) === NoMode) {
+    return SyncLane;
+  }
+
+  // 2. 渲染阶段更新：复用当前渲染的 lane（实现批量更新）
+  if ((executionContext & RenderContext) !== NoContext &&
+      workInProgressRootRenderLanes !== NoLanes) {
+    return pickArbitraryLane(workInProgressRootRenderLanes);
+  }
+
+  // 3. Transition 更新：分配 transition lane
+  const isTransition = requestCurrentTransition() !== NoTransition;
+  if (isTransition) {
+    if (currentEventTransitionLane === NoLane) {
+      // 分配一个新的 transition lane
+      currentEventTransitionLane = claimNextTransitionLane();
+    }
+    return currentEventTransitionLane;
+  }
+
+  // 4. React 内部事件触发的优先级
+  const updateLane = getCurrentUpdatePriority();
+  if (updateLane !== NoLane) {
+    return updateLane;
+  }
+
+  // 5. React 外部事件（原生事件）触发的优先级
+  const eventLane = getCurrentEventPriority();
+  return eventLane;
+}
+```
+
+#### 1.5.4 getNextLanes - 获取下一个要处理的 Lanes
+
+这是调度系统的核心函数，决定接下来要处理哪些优先级的任务：
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberLane.new.js:187
+
+export function getNextLanes(root: FiberRoot, wipLanes: Lanes): Lanes {
+  const pendingLanes = root.pendingLanes;
+  if (pendingLanes === NoLanes) {
+    return NoLanes;
+  }
+
+  let nextLanes = NoLanes;
+  const suspendedLanes = root.suspendedLanes;
+  const pingedLanes = root.pingedLanes;
+
+  // 1. 优先处理非 Idle 任务
+  const nonIdlePendingLanes = pendingLanes & NonIdleLanes;
+  if (nonIdlePendingLanes !== NoLanes) {
+    // 优先处理未被挂起的任务
+    const nonIdleUnblockedLanes = nonIdlePendingLanes & ~suspendedLanes;
+    if (nonIdleUnblockedLanes !== NoLanes) {
+      nextLanes = getHighestPriorityLanes(nonIdleUnblockedLanes);
+    } else {
+      // 否则处理已被 ping 的任务（Suspense 恢复）
+      const nonIdlePingedLanes = nonIdlePendingLanes & pingedLanes;
+      if (nonIdlePingedLanes !== NoLanes) {
+        nextLanes = getHighestPriorityLanes(nonIdlePingedLanes);
+      }
+    }
+  } else {
+    // 2. 只剩 Idle 任务
+    const unblockedLanes = pendingLanes & ~suspendedLanes;
+    if (unblockedLanes !== NoLanes) {
+      nextLanes = getHighestPriorityLanes(unblockedLanes);
+    } else if (pingedLanes !== NoLanes) {
+      nextLanes = getHighestPriorityLanes(pingedLanes);
+    }
+  }
+
+  // 3. 判断是否需要中断当前渲染（高优先级插队）
+  if (wipLanes !== NoLanes && wipLanes !== nextLanes &&
+      (wipLanes & suspendedLanes) === NoLanes) {
+    const nextLane = getHighestPriorityLane(nextLanes);
+    const wipLane = getHighestPriorityLane(wipLanes);
+    // 如果新任务优先级不高于当前任务，继续当前渲染
+    if (nextLane >= wipLane ||
+        (nextLane === DefaultLane && (wipLane & TransitionLanes) !== NoLanes)) {
+      return wipLanes;
+    }
+  }
+
+  // 4. 处理 entangled lanes（纠缠的 lane，必须一起处理）
+  const entangledLanes = root.entangledLanes;
+  if (entangledLanes !== NoLanes) {
+    const entanglements = root.entanglements;
+    let lanes = nextLanes & entangledLanes;
+    while (lanes > 0) {
+      const index = pickArbitraryLaneIndex(lanes);
+      const lane = 1 << index;
+      nextLanes |= entanglements[index];
+      lanes &= ~lane;
+    }
+  }
+
+  return nextLanes;
+}
+```
+
+#### 1.5.5 Lane 与 Scheduler 优先级的映射
+
+React 内部使用 Lane，但 Scheduler 使用数字优先级。它们之间需要转换：
+
+```typescript
+// 源码位置：react-reconciler/src/ReactEventPriorities.new.js
+
+// EventPriority 实际上就是对应的 Lane 值
+export const DiscreteEventPriority: EventPriority = SyncLane;           // 离散事件
+export const ContinuousEventPriority: EventPriority = InputContinuousLane;  // 连续事件
+export const DefaultEventPriority: EventPriority = DefaultLane;         // 默认事件
+export const IdleEventPriority: EventPriority = IdleLane;               // 空闲事件
+
+// Lane 转 EventPriority
+export function lanesToEventPriority(lanes: Lanes): EventPriority {
+  const lane = getHighestPriorityLane(lanes);
+  if (!isHigherEventPriority(DiscreteEventPriority, lane)) {
+    return DiscreteEventPriority;  // SyncLane
+  }
+  if (!isHigherEventPriority(ContinuousEventPriority, lane)) {
+    return ContinuousEventPriority;  // InputContinuousLane
+  }
+  if (includesNonIdleWork(lane)) {
+    return DefaultEventPriority;  // DefaultLane
+  }
+  return IdleEventPriority;  // IdleLane
+}
+```
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberWorkLoop.new.js
+// 在 ensureRootIsScheduled 中的转换
+
+let schedulerPriorityLevel;
+switch (lanesToEventPriority(nextLanes)) {
+  case DiscreteEventPriority:
+    schedulerPriorityLevel = ImmediateSchedulerPriority;  // 1
+    break;
+  case ContinuousEventPriority:
+    schedulerPriorityLevel = UserBlockingSchedulerPriority;  // 2
+    break;
+  case DefaultEventPriority:
+    schedulerPriorityLevel = NormalSchedulerPriority;  // 3
+    break;
+  case IdleEventPriority:
+    schedulerPriorityLevel = IdleSchedulerPriority;  // 5
+    break;
+  default:
+    schedulerPriorityLevel = NormalSchedulerPriority;
+}
+
+// Scheduler 优先级定义
+// 源码位置：scheduler/src/SchedulerPriorities.js
+export const NoPriority = 0;
+export const ImmediatePriority = 1;     // 立即执行，timeout = -1
+export const UserBlockingPriority = 2;  // 用户阻塞，timeout = 250ms
+export const NormalPriority = 3;        // 普通，timeout = 5000ms
+export const LowPriority = 4;           // 低优先级，timeout = 10000ms
+export const IdlePriority = 5;          // 空闲，timeout = maxSigned31BitInt（永不过期）
+```
+
+#### 1.5.6 完整的优先级映射表
+
+```
+┌─────────────────────────┬─────────────────────────┬─────────────────────┬──────────────────────────┬────────────┐
+│ DOM 事件类型            │ EventPriority           │ Lane                │ Scheduler Priority       │ Timeout    │
+├─────────────────────────┼─────────────────────────┼─────────────────────┼──────────────────────────┼────────────┤
+│ click, keydown, input   │ DiscreteEventPriority   │ SyncLane            │ ImmediatePriority (1)    │ -1 (立即)  │
+├─────────────────────────┼─────────────────────────┼─────────────────────┼──────────────────────────┼────────────┤
+│ mousemove, scroll, drag │ ContinuousEventPriority │ InputContinuousLane │ UserBlockingPriority (2) │ 250ms      │
+├─────────────────────────┼─────────────────────────┼─────────────────────┼──────────────────────────┼────────────┤
+│ 默认 / useTransition    │ DefaultEventPriority    │ DefaultLane /       │ NormalPriority (3)       │ 5000ms     │
+│                         │                         │ TransitionLanes     │                          │            │
+├─────────────────────────┼─────────────────────────┼─────────────────────┼──────────────────────────┼────────────┤
+│ requestIdleCallback     │ IdleEventPriority       │ IdleLane            │ IdlePriority (5)         │ 永不过期   │
+└─────────────────────────┴─────────────────────────┴─────────────────────┴──────────────────────────┴────────────┘
+```
+
+#### 1.5.7 FiberRoot 中 Lane 相关字段
+
+```typescript
+type FiberRoot = {
+  // ... 其他字段
+
+  // Lane 优先级管理
+  pendingLanes: Lanes,      // 待处理的 lanes（所有未完成的更新）
+  suspendedLanes: Lanes,    // 被挂起的 lanes（Suspense 造成）
+  pingedLanes: Lanes,       // 被 ping 的 lanes（Suspense 数据加载完成）
+  expiredLanes: Lanes,      // 已过期的 lanes（需要同步执行，防止饥饿）
+  mutableReadLanes: Lanes,  // 可变读取的 lanes
+  finishedLanes: Lanes,     // 已完成的 lanes（render 阶段完成，等待 commit）
+
+  // Lane 纠缠（entanglement）
+  entangledLanes: Lanes,          // 有纠缠关系的 lanes
+  entanglements: LaneMap<Lanes>,  // 每个 lane 纠缠的其他 lanes（必须一起处理）
+
+  // 时间记录
+  eventTimes: LaneMap<number>,       // 每个 lane 的事件触发时间
+  expirationTimes: LaneMap<number>,  // 每个 lane 的过期时间
+};
+```
+
+#### 1.5.8 防饥饿机制
+
+低优先级任务可能会被高优先级任务不断打断，导致"饥饿"。React 通过过期时间机制防止这种情况：
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberLane.new.js
+
+export function markStarvedLanesAsExpired(
+  root: FiberRoot,
+  currentTime: number,
+): void {
+  const pendingLanes = root.pendingLanes;
+  const suspendedLanes = root.suspendedLanes;
+  const pingedLanes = root.pingedLanes;
+  const expirationTimes = root.expirationTimes;
+
+  let lanes = pendingLanes;
+  while (lanes > 0) {
+    const index = pickArbitraryLaneIndex(lanes);
+    const lane = 1 << index;
+    const expirationTime = expirationTimes[index];
+
+    if (expirationTime === NoTimestamp) {
+      // 首次看到这个 lane，计算过期时间
+      if ((lane & suspendedLanes) === NoLanes ||
+          (lane & pingedLanes) !== NoLanes) {
+        expirationTimes[index] = computeExpirationTime(lane, currentTime);
+      }
+    } else if (expirationTime <= currentTime) {
+      // 已过期，标记为 expired（必须同步执行）
+      root.expiredLanes |= lane;
+    }
+
+    lanes &= ~lane;
+  }
+}
+```
+
+当 lane 被标记为 `expiredLanes` 后，即使有更高优先级的任务，也必须先处理过期的任务，从而防止饥饿。
+
 ---
 
 ## 第二部分：初始化流程（createRoot + render）
@@ -309,7 +686,1069 @@ export function createRoot(
 }
 ```
 
-### 2.3 createFiberRoot 详解
+### 2.3 事件系统详解（listenToAllSupportedEvents）
+
+React 的事件系统是一个完整的事件委托机制，在 `createRoot` 时通过 `listenToAllSupportedEvents` 将所有支持的事件绑定到根容器上。
+
+#### 2.3.1 事件委托机制
+
+**核心思想：** React 不会在每个 DOM 元素上绑定事件，而是将所有事件统一绑定到根容器（container）上，通过事件冒泡/捕获机制处理所有子元素的事件。
+
+```typescript
+// 源码位置：react-dom/src/events/DOMPluginEventSystem.js
+
+const listeningMarker = '_reactListening' + Math.random().toString(36).slice(2);
+
+export function listenToAllSupportedEvents(rootContainerElement: EventTarget) {
+  // 1. 避免重复绑定（通过标记判断）
+  if (!(rootContainerElement: any)[listeningMarker]) {
+    (rootContainerElement: any)[listeningMarker] = true;
+
+    // 2. 遍历所有原生事件，绑定到 container 上
+    allNativeEvents.forEach(domEventName => {
+      // selectionchange 特殊处理，需要绑定到 document
+      if (domEventName !== 'selectionchange') {
+        // 非委托事件（scroll、load 等不冒泡的事件）
+        if (!nonDelegatedEvents.has(domEventName)) {
+          // 绑定冒泡阶段
+          listenToNativeEvent(domEventName, false, rootContainerElement);
+        }
+        // 绑定捕获阶段
+        listenToNativeEvent(domEventName, true, rootContainerElement);
+      }
+    });
+
+    // 3. selectionchange 绑定到 document
+    const ownerDocument = rootContainerElement.ownerDocument;
+    if (ownerDocument !== null) {
+      if (!(ownerDocument: any)[listeningMarker]) {
+        (ownerDocument: any)[listeningMarker] = true;
+        listenToNativeEvent('selectionchange', false, ownerDocument);
+      }
+    }
+  }
+}
+
+// 不委托的事件（这些事件不冒泡）
+export const nonDelegatedEvents: Set<DOMEventName> = new Set([
+  'cancel',
+  'close',
+  'invalid',
+  'load',
+  'scroll',
+  'toggle',
+  // 媒体事件
+  'abort', 'canplay', 'canplaythrough', 'durationchange', 'emptied',
+  'encrypted', 'ended', 'error', 'loadeddata', 'loadedmetadata',
+  'loadstart', 'pause', 'play', 'playing', 'progress', 'ratechange',
+  'resize', 'seeked', 'seeking', 'stalled', 'suspend', 'timeupdate',
+  'volumechange', 'waiting',
+]);
+```
+
+#### 2.3.2 事件优先级绑定
+
+React 根据事件类型分配不同的优先级，不同优先级使用不同的 listener 包装函数：
+
+```typescript
+// 源码位置：react-dom/src/events/ReactDOMEventListener.js
+
+export function createEventListenerWrapperWithPriority(
+  targetContainer: EventTarget,
+  domEventName: DOMEventName,
+  eventSystemFlags: EventSystemFlags,
+): Function {
+  // 根据事件名获取优先级
+  const eventPriority = getEventPriority(domEventName);
+
+  let listenerWrapper;
+  switch (eventPriority) {
+    case DiscreteEventPriority:      // 最高优先级（SyncLane）
+      listenerWrapper = dispatchDiscreteEvent;
+      break;
+    case ContinuousEventPriority:    // 连续事件优先级
+      listenerWrapper = dispatchContinuousEvent;
+      break;
+    case DefaultEventPriority:       // 默认优先级
+    default:
+      listenerWrapper = dispatchEvent;
+      break;
+  }
+
+  return listenerWrapper.bind(null, domEventName, eventSystemFlags, targetContainer);
+}
+
+// 获取事件优先级
+export function getEventPriority(domEventName: DOMEventName): * {
+  switch (domEventName) {
+    // 离散事件 - 最高优先级（DiscreteEventPriority = SyncLane）
+    case 'click':
+    case 'keydown':
+    case 'keyup':
+    case 'mousedown':
+    case 'mouseup':
+    case 'input':
+    case 'change':
+    case 'focus':
+    case 'blur':
+    case 'submit':
+    // ... 等等
+      return DiscreteEventPriority;
+
+    // 连续事件 - 中等优先级（ContinuousEventPriority = InputContinuousLane）
+    case 'drag':
+    case 'mousemove':
+    case 'mouseout':
+    case 'mouseover':
+    case 'scroll':
+    case 'touchmove':
+    case 'wheel':
+    // ... 等等
+      return ContinuousEventPriority;
+
+    // 其他事件 - 默认优先级
+    default:
+      return DefaultEventPriority;
+  }
+}
+```
+
+**事件优先级映射表：**
+
+```
+┌────────────────────────┬───────────────────────────┬──────────────────────┐
+│ 事件类型               │ 事件名示例                │ 优先级               │
+├────────────────────────┼───────────────────────────┼──────────────────────┤
+│ 离散事件（Discrete）   │ click, keydown, input,    │ DiscreteEventPriority│
+│                        │ change, focus, blur,      │ = SyncLane (1)       │
+│                        │ submit, mousedown...      │                      │
+├────────────────────────┼───────────────────────────┼──────────────────────┤
+│ 连续事件（Continuous） │ mousemove, scroll, drag,  │ ContinuousEventPriority│
+│                        │ touchmove, wheel,         │ = InputContinuousLane│
+│                        │ pointerover...            │ (4)                  │
+├────────────────────────┼───────────────────────────┼──────────────────────┤
+│ 默认事件               │ message, 其他未分类事件   │ DefaultEventPriority │
+│                        │                           │ = DefaultLane (16)   │
+└────────────────────────┴───────────────────────────┴──────────────────────┘
+```
+
+#### 2.3.3 合成事件（SyntheticEvent）
+
+React 使用合成事件包装原生事件，提供跨浏览器一致的 API：
+
+```typescript
+// 源码位置：react-dom/src/events/SyntheticEvent.js
+
+function createSyntheticEvent(Interface: EventInterfaceType) {
+  function SyntheticBaseEvent(
+    reactName: string | null,      // React 事件名，如 'onClick'
+    reactEventType: string,        // 事件类型，如 'click'
+    targetInst: Fiber,             // 目标 Fiber 节点
+    nativeEvent: Object,           // 原生事件对象
+    nativeEventTarget: EventTarget // 原生事件目标
+  ) {
+    this._reactName = reactName;
+    this._targetInst = targetInst;
+    this.type = reactEventType;
+    this.nativeEvent = nativeEvent;      // 保留原生事件的引用
+    this.target = nativeEventTarget;
+    this.currentTarget = null;
+
+    // 从 Interface 复制属性（标准化不同浏览器的差异）
+    for (const propName in Interface) {
+      const normalize = Interface[propName];
+      if (normalize) {
+        this[propName] = normalize(nativeEvent);  // 标准化处理
+      } else {
+        this[propName] = nativeEvent[propName];   // 直接复制
+      }
+    }
+
+    // 处理 defaultPrevented
+    this.isDefaultPrevented = nativeEvent.defaultPrevented
+      ? functionThatReturnsTrue
+      : functionThatReturnsFalse;
+    this.isPropagationStopped = functionThatReturnsFalse;
+
+    return this;
+  }
+
+  // 添加方法
+  assign(SyntheticBaseEvent.prototype, {
+    preventDefault: function() {
+      this.defaultPrevented = true;
+      const event = this.nativeEvent;
+      if (event.preventDefault) {
+        event.preventDefault();
+      }
+      this.isDefaultPrevented = functionThatReturnsTrue;
+    },
+
+    stopPropagation: function() {
+      const event = this.nativeEvent;
+      if (event.stopPropagation) {
+        event.stopPropagation();
+      }
+      this.isPropagationStopped = functionThatReturnsTrue;
+    },
+  });
+
+  return SyntheticBaseEvent;
+}
+
+// 不同类型事件的合成事件构造函数
+export const SyntheticEvent = createSyntheticEvent(EventInterface);
+export const SyntheticMouseEvent = createSyntheticEvent(MouseEventInterface);
+export const SyntheticKeyboardEvent = createSyntheticEvent(KeyboardEventInterface);
+export const SyntheticFocusEvent = createSyntheticEvent(FocusEventInterface);
+export const SyntheticTouchEvent = createSyntheticEvent(TouchEventInterface);
+export const SyntheticWheelEvent = createSyntheticEvent(WheelEventInterface);
+// ... 等等
+```
+
+**合成事件与原生事件的区别：**
+
+| 特性 | 原生事件 | React 合成事件 |
+|------|---------|---------------|
+| 事件绑定 | 绑定在具体 DOM 元素上 | 委托到根容器 |
+| 事件命名 | 全小写（onclick） | 驼峰命名（onClick） |
+| 阻止默认 | event.preventDefault() | 相同，但也可以 return false |
+| 事件对象 | 浏览器原生 Event | SyntheticEvent（包装原生事件） |
+| 跨浏览器 | 存在差异 | 统一标准化 |
+| this 指向 | DOM 元素 | undefined（需要手动绑定） |
+
+#### 2.3.4 事件触发与收集流程
+
+当用户触发事件时，React 的处理流程如下：
+
+```typescript
+// 1. 触发绑定在 container 上的 listener（dispatchDiscreteEvent/dispatchContinuousEvent/dispatchEvent）
+
+// 离散事件触发函数
+function dispatchDiscreteEvent(
+  domEventName,
+  eventSystemFlags,
+  container,
+  nativeEvent,
+) {
+  // 保存之前的优先级
+  const previousPriority = getCurrentUpdatePriority();
+  const prevTransition = ReactCurrentBatchConfig.transition;
+  ReactCurrentBatchConfig.transition = null;
+
+  try {
+    // 设置当前更新优先级为离散事件优先级
+    setCurrentUpdatePriority(DiscreteEventPriority);
+    // 调用通用的 dispatchEvent
+    dispatchEvent(domEventName, eventSystemFlags, container, nativeEvent);
+  } finally {
+    // 恢复之前的优先级
+    setCurrentUpdatePriority(previousPriority);
+    ReactCurrentBatchConfig.transition = prevTransition;
+  }
+}
+
+// 2. dispatchEvent 找到触发事件的 Fiber 节点
+function dispatchEvent(
+  domEventName: DOMEventName,
+  eventSystemFlags: EventSystemFlags,
+  targetContainer: EventTarget,
+  nativeEvent: AnyNativeEvent,
+) {
+  // 找到触发事件的 DOM 和对应的 Fiber
+  let blockedOn = findInstanceBlockingEvent(
+    domEventName,
+    eventSystemFlags,
+    targetContainer,
+    nativeEvent,
+  );
+
+  if (blockedOn === null) {
+    // 通过插件系统派发事件
+    dispatchEventForPluginEventSystem(
+      domEventName,
+      eventSystemFlags,
+      nativeEvent,
+      return_targetInst,  // 目标 Fiber
+      targetContainer,
+    );
+    return;
+  }
+  // ... 处理 hydration 等特殊情况
+}
+
+// 3. 通过插件系统派发事件
+export function dispatchEventForPluginEventSystem(
+  domEventName: DOMEventName,
+  eventSystemFlags: EventSystemFlags,
+  nativeEvent: AnyNativeEvent,
+  targetInst: null | Fiber,
+  targetContainer: EventTarget,
+): void {
+  // ... 查找祖先节点
+
+  // 使用批量更新包装事件处理
+  batchedUpdates(() =>
+    dispatchEventsForPlugins(
+      domEventName,
+      eventSystemFlags,
+      nativeEvent,
+      ancestorInst,
+      targetContainer,
+    ),
+  );
+}
+
+// 4. 收集事件监听器
+function dispatchEventsForPlugins(
+  domEventName: DOMEventName,
+  eventSystemFlags: EventSystemFlags,
+  nativeEvent: AnyNativeEvent,
+  targetInst: null | Fiber,
+  targetContainer: EventTarget,
+): void {
+  const nativeEventTarget = getEventTarget(nativeEvent);
+  const dispatchQueue: DispatchQueue = [];
+
+  // 收集事件（通过各种插件）
+  extractEvents(
+    dispatchQueue,
+    domEventName,
+    targetInst,
+    nativeEvent,
+    nativeEventTarget,
+    eventSystemFlags,
+    targetContainer,
+  );
+
+  // 处理收集到的事件
+  processDispatchQueue(dispatchQueue, eventSystemFlags);
+}
+```
+
+#### 2.3.5 事件收集（从目标到根）
+
+```typescript
+// 源码位置：react-dom/src/events/DOMPluginEventSystem.js
+
+export function accumulateSinglePhaseListeners(
+  targetFiber: Fiber | null,
+  reactName: string | null,       // 'onClick'
+  nativeEventType: string,        // 'click'
+  inCapturePhase: boolean,
+  accumulateTargetOnly: boolean,
+  nativeEvent: AnyNativeEvent,
+): Array<DispatchListener> {
+  const captureName = reactName !== null ? reactName + 'Capture' : null;
+  const reactEventName = inCapturePhase ? captureName : reactName;
+  let listeners: Array<DispatchListener> = [];
+
+  let instance = targetFiber;
+
+  // 从触发事件的 Fiber 向上遍历到根节点，收集所有同名事件
+  while (instance !== null) {
+    const {stateNode, tag} = instance;
+
+    // 只处理 HostComponent（DOM 元素）
+    if (tag === HostComponent && stateNode !== null) {
+      // 从 Fiber 的 props 中获取事件监听器
+      if (reactEventName !== null) {
+        const listener = getListener(instance, reactEventName);
+        if (listener != null) {
+          listeners.push(
+            createDispatchListener(instance, listener, stateNode),
+          );
+        }
+      }
+    }
+
+    // 如果只需要目标节点的事件（如 scroll），不继续向上收集
+    if (accumulateTargetOnly) {
+      break;
+    }
+
+    // 继续向上遍历
+    instance = instance.return;
+  }
+
+  return listeners;
+}
+
+// 从 Fiber 的 props 中获取事件监听器
+export default function getListener(
+  inst: Fiber,
+  registrationName: string,  // 'onClick'
+): Function | null {
+  const stateNode = inst.stateNode;
+  // 获取当前 Fiber 对应 DOM 节点的 props
+  const props = getFiberCurrentPropsFromNode(stateNode);
+  // 返回对应的事件处理函数
+  const listener = props[registrationName];  // props.onClick
+  return listener;
+}
+```
+
+#### 2.3.6 事件执行
+
+```typescript
+// 源码位置：react-dom/src/events/DOMPluginEventSystem.js
+
+export function processDispatchQueue(
+  dispatchQueue: DispatchQueue,
+  eventSystemFlags: EventSystemFlags,
+): void {
+  const inCapturePhase = (eventSystemFlags & IS_CAPTURE_PHASE) !== 0;
+
+  for (let i = 0; i < dispatchQueue.length; i++) {
+    const {event, listeners} = dispatchQueue[i];
+    processDispatchQueueItemsInOrder(event, listeners, inCapturePhase);
+  }
+
+  rethrowCaughtError();
+}
+
+function processDispatchQueueItemsInOrder(
+  event: ReactSyntheticEvent,
+  dispatchListeners: Array<DispatchListener>,
+  inCapturePhase: boolean,
+): void {
+  let previousInstance;
+
+  if (inCapturePhase) {
+    // 捕获阶段：从后往前执行（从根到目标）
+    for (let i = dispatchListeners.length - 1; i >= 0; i--) {
+      const {instance, currentTarget, listener} = dispatchListeners[i];
+      if (instance !== previousInstance && event.isPropagationStopped()) {
+        return;  // 如果调用了 stopPropagation，停止执行
+      }
+      executeDispatch(event, listener, currentTarget);
+      previousInstance = instance;
+    }
+  } else {
+    // 冒泡阶段：从前往后执行（从目标到根）
+    for (let i = 0; i < dispatchListeners.length; i++) {
+      const {instance, currentTarget, listener} = dispatchListeners[i];
+      if (instance !== previousInstance && event.isPropagationStopped()) {
+        return;
+      }
+      executeDispatch(event, listener, currentTarget);
+      previousInstance = instance;
+    }
+  }
+}
+
+function executeDispatch(
+  event: ReactSyntheticEvent,
+  listener: Function,
+  currentTarget: EventTarget,
+): void {
+  event.currentTarget = currentTarget;
+  // 执行事件处理函数，this 为 undefined
+  invokeGuardedCallbackAndCatchFirstError(
+    event.type,
+    listener,
+    undefined,  // this 为 undefined，这就是为什么 React 事件中 this 为 undefined
+    event,
+  );
+  event.currentTarget = null;
+}
+```
+
+#### 2.3.7 原生事件与 React 事件同时绑定
+
+当一个元素同时绑定原生事件和 React 事件时，**原生事件先于 React 事件执行**。
+
+```jsx
+function App() {
+  const divRef = useRef(null);
+
+  useEffect(() => {
+    // 原生事件
+    divRef.current.addEventListener('click', () => {
+      console.log('1. 原生事件 - 冒泡阶段');
+    });
+    divRef.current.addEventListener('click', () => {
+      console.log('0. 原生事件 - 捕获阶段');
+    }, true);
+  }, []);
+
+  return (
+    <div
+      ref={divRef}
+      onClick={() => console.log('3. React 事件 - 冒泡阶段')}
+      onClickCapture={() => console.log('2. React 事件 - 捕获阶段')}
+    >
+      点击我
+    </div>
+  );
+}
+
+// 点击后输出顺序：
+// 0. 原生事件 - 捕获阶段
+// 1. 原生事件 - 冒泡阶段
+// 2. React 事件 - 捕获阶段
+// 3. React 事件 - 冒泡阶段
+```
+
+**执行顺序原理：**
+
+```
+事件流程：
+                    捕获阶段                冒泡阶段
+                        ↓                     ↑
+    document  ─────────────────────────────────────
+                        ↓                     ↑
+    container ─────────────────────────────────────  ← React 事件绑定在这里
+                        ↓                     ↑
+    父元素    ─────────────────────────────────────
+                        ↓                     ↑
+    目标元素  ─────────────────────────────────────  ← 原生事件绑定在这里
+
+1. 捕获阶段从 document 向下传播，到达目标元素
+2. 原生事件在目标元素上触发
+3. 冒泡阶段从目标元素向上传播
+4. 到达 container 时触发 React 的事件处理
+5. React 在内部模拟捕获/冒泡阶段
+```
+
+**注意事项：**
+- 原生事件中调用 `e.stopPropagation()` 会阻止 React 事件触发（因为事件无法冒泡到 container）
+- React 事件中调用 `e.stopPropagation()` 只能阻止 React 事件的传播，不影响原生事件
+- 如果需要在 React 事件中阻止原生事件，需要使用 `e.nativeEvent.stopImmediatePropagation()`
+
+#### 2.3.8 事件系统流程总结
+
+```
+用户点击 DOM 元素
+        │
+        ├─ [捕获阶段] 事件从 document 向下传播
+        │         │
+        │         └─ 经过 container（React 捕获监听器触发点）
+        │                   │
+        │                   └─ 到达目标元素
+        │
+        ├─ [目标阶段] 原生事件在目标元素触发
+        │
+        └─ [冒泡阶段] 事件从目标元素向上传播
+                  │
+                  └─ 到达 container
+                           │
+                           └─ 触发 React 的事件 listener
+                                    │
+                                    ├─ dispatchDiscreteEvent/dispatchContinuousEvent
+                                    │        │
+                                    │        └─ 设置当前更新优先级
+                                    │
+                                    ├─ dispatchEvent
+                                    │        │
+                                    │        └─ findInstanceBlockingEvent（找到目标 Fiber）
+                                    │
+                                    ├─ dispatchEventForPluginEventSystem
+                                    │        │
+                                    │        └─ batchedUpdates（批量更新包装）
+                                    │
+                                    ├─ extractEvents
+                                    │        │
+                                    │        └─ accumulateSinglePhaseListeners
+                                    │                 │
+                                    │                 └─ 从目标 Fiber 向上收集所有同名事件监听器
+                                    │
+                                    └─ processDispatchQueue
+                                             │
+                                             └─ 按顺序执行收集到的监听器
+                                                      │
+                                                      └─ executeDispatch（this = undefined）
+```
+
+#### 2.3.9 JSX 事件属性的存储与获取机制
+
+当我们在 JSX 中写 `<div onClick={handleClick} />` 时，React 并不会把事件直接绑定到这个 DOM 元素上。事件是通过事件委托绑定在 container 上的。那 `onClick` 这个属性存储在哪里？事件触发时又是如何找到它的？
+
+**1. JSX 到 createElement 的转换**
+
+```jsx
+// 你写的 JSX
+<div onClick={handleClick} className="box">Hello</div>
+
+// Babel 编译后
+React.createElement('div', {
+  onClick: handleClick,
+  className: 'box'
+}, 'Hello');
+
+// 返回的 React Element 结构
+{
+  $$typeof: Symbol(react.element),
+  type: 'div',
+  props: {
+    onClick: handleClick,    // 事件处理函数存在 props 中
+    className: 'box',
+    children: 'Hello'
+  },
+  key: null,
+  ref: null,
+}
+```
+
+**2. Fiber 节点创建时 props 的处理**
+
+在 render 阶段，React 会为每个 React Element 创建对应的 Fiber 节点：
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiber.new.js
+
+function createFiberFromElement(element, mode, lanes) {
+  const type = element.type;
+  const key = element.key;
+  const pendingProps = element.props;  // props（包含 onClick）存储在 Fiber.pendingProps
+
+  let fiber = createFiberFromTypeAndProps(
+    type,
+    key,
+    pendingProps,  // 传递给 Fiber
+    owner,
+    mode,
+    lanes,
+  );
+  return fiber;
+}
+```
+
+**3. DOM 节点创建时 props 的存储**
+
+在 commit 阶段，当 DOM 节点被创建时，React 会将 props 存储到 DOM 节点上：
+
+```typescript
+// 源码位置：react-dom/src/client/ReactDOMComponentTree.js
+
+// 生成随机 key 避免冲突
+const randomKey = Math.random().toString(36).slice(2);
+const internalInstanceKey = '__reactFiber$' + randomKey;
+const internalPropsKey = '__reactProps$' + randomKey;  // 用于存储 props
+
+// 将 Fiber 节点存储到 DOM 上
+export function precacheFiberNode(hostInst: Fiber, node: Instance): void {
+  (node: any)[internalInstanceKey] = hostInst;  // DOM.__reactFiber$ = Fiber
+}
+
+// 将 props 存储到 DOM 上
+export function updateFiberProps(node: Instance, props: Props): void {
+  (node: any)[internalPropsKey] = props;  // DOM.__reactProps$ = props
+}
+
+// 从 DOM 上获取 props
+export function getFiberCurrentPropsFromNode(node: Instance): Props {
+  return (node: any)[internalPropsKey] || null;  // 返回 DOM.__reactProps$
+}
+```
+
+**4. updateFiberProps 的调用时机**
+
+在 commit 阶段创建或更新 DOM 时调用：
+
+```typescript
+// 源码位置：react-dom/src/client/ReactDOMHostConfig.js
+
+export function createInstance(
+  type: string,
+  props: Props,
+  rootContainerInstance: Container,
+  hostContext: HostContext,
+  internalInstanceHandle: Object,  // 对应的 Fiber
+): Instance {
+  // 1. 创建 DOM 元素
+  const domElement: Instance = createElement(type, props, rootContainerInstance);
+
+  // 2. 将 Fiber 存储到 DOM 上
+  precacheFiberNode(internalInstanceHandle, domElement);
+
+  // 3. 将 props 存储到 DOM 上（包含 onClick 等事件处理函数）
+  updateFiberProps(domElement, props);
+
+  return domElement;
+}
+```
+
+**5. 事件触发时获取处理函数的流程**
+
+```typescript
+// 源码位置：react-dom/src/events/getListener.js
+
+export default function getListener(
+  inst: Fiber,           // 目标 Fiber 节点
+  registrationName: string,  // 如 'onClick'
+): Function | null {
+  const stateNode = inst.stateNode;  // 获取 DOM 节点
+  if (stateNode === null) {
+    return null;
+  }
+
+  // 从 DOM 节点上获取 props
+  const props = getFiberCurrentPropsFromNode(stateNode);
+  if (props === null) {
+    return null;
+  }
+
+  // 从 props 中获取事件处理函数
+  const listener = props[registrationName];  // props.onClick
+
+  // 对于 disabled 的交互元素，阻止鼠标事件
+  if (shouldPreventMouseEvent(registrationName, inst.type, props)) {
+    return null;
+  }
+
+  return listener;
+}
+```
+
+**6. 完整的数据流向图**
+
+```
+JSX: <div onClick={handleClick} />
+              │
+              ▼
+createElement → React Element { props: { onClick: handleClick } }
+              │
+              ▼
+createFiberFromElement → Fiber { pendingProps: { onClick: handleClick } }
+              │
+              ▼
+commit 阶段 createInstance
+              │
+              ├─ 创建 DOM: <div>
+              │
+              ├─ precacheFiberNode(fiber, dom)
+              │     └─ dom.__reactFiber$ = fiber
+              │
+              └─ updateFiberProps(dom, props)
+                    └─ dom.__reactProps$ = { onClick: handleClick }
+
+事件触发时：
+              │
+              ▼
+dispatchEvent → 获取 event.target (DOM)
+              │
+              ▼
+getClosestInstanceFromNode(dom) → dom.__reactFiber$ → Fiber
+              │
+              ▼
+accumulateSinglePhaseListeners → 向上遍历 Fiber 树
+              │
+              ▼
+getListener(fiber, 'onClick')
+   └─ getFiberCurrentPropsFromNode(fiber.stateNode)
+         └─ dom.__reactProps$.onClick → handleClick
+```
+
+**7. 为什么不直接存在 Fiber 上？**
+
+你可能会问：为什么要把 props 存在 DOM 节点上，而不是直接从 Fiber.memoizedProps 获取？
+
+原因是 React 使用双缓冲技术（current/workInProgress），在渲染过程中会有两棵 Fiber 树。事件触发时，React 需要确保获取的是"当前已渲染完成"的 props，而不是"正在构建中"的 props。通过 DOM 节点作为桥梁，可以确保获取到稳定的、已提交到屏幕上的 props。
+
+```typescript
+// 源码位置：react-dom/src/events/DOMPluginEventSystem.js
+
+function accumulateSinglePhaseListeners(
+  targetFiber: Fiber | null,
+  reactName: string | null,    // 如 'onClick'
+  nativeEventType: string,
+  inCapturePhase: boolean,
+  accumulateTargetOnly: boolean,
+  nativeEvent: AnyNativeEvent,
+): Array<DispatchListener> {
+  const listeners: Array<DispatchListener> = [];
+  let instance = targetFiber;
+
+  // 从目标 Fiber 向上遍历到 HostRoot
+  while (instance !== null) {
+    const {stateNode, tag} = instance;
+    if (tag === HostComponent && stateNode !== null) {
+      // 获取事件处理函数
+      const listener = getListener(instance, reactName);
+      if (listener != null) {
+        listeners.push({
+          instance,
+          listener,
+          currentTarget: stateNode,
+        });
+      }
+    }
+
+    if (accumulateTargetOnly) {
+      break;
+    }
+    instance = instance.return;  // 继续向上遍历
+  }
+
+  return listeners;
+}
+```
+
+#### 2.3.10 useTransition 与事件优先级降级机制
+
+当在点击事件中使用 `useTransition` 包裹 `setState` 时，React 会将更新优先级从高优先级（SyncLane）降级为低优先级（TransitionLane）。
+
+**1. useTransition 的基本用法**
+
+```jsx
+function SearchComponent() {
+  const [isPending, startTransition] = useTransition();
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+
+  const handleChange = (e) => {
+    // 高优先级更新：立即更新输入框
+    setQuery(e.target.value);
+
+    // 低优先级更新：搜索结果可以延迟
+    startTransition(() => {
+      setResults(search(e.target.value));
+    });
+  };
+
+  return (
+    <div>
+      <input value={query} onChange={handleChange} />
+      {isPending && <span>加载中...</span>}
+      <ResultList results={results} />
+    </div>
+  );
+}
+```
+
+**2. useTransition 的内部实现**
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberHooks.new.js
+
+function mountTransition(): [boolean, (callback: () => void) => void] {
+  // 创建一个 state 来追踪 pending 状态
+  const [isPending, setPending] = mountState(false);
+
+  // startTransition 函数绑定 setPending
+  const start = startTransition.bind(null, setPending);
+
+  // 将 start 函数存储在 hook 上
+  const hook = mountWorkInProgressHook();
+  hook.memoizedState = start;
+
+  return [isPending, start];
+}
+```
+
+**3. startTransition 的核心逻辑**
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberHooks.new.js
+
+function startTransition(setPending, callback, options) {
+  // 1. 保存当前的更新优先级
+  const previousPriority = getCurrentUpdatePriority();
+
+  // 2. 设置更新优先级为 ContinuousEventPriority（不是最高，但也不低）
+  setCurrentUpdatePriority(
+    higherEventPriority(previousPriority, ContinuousEventPriority),
+  );
+
+  // 3. 高优先级：设置 isPending = true
+  setPending(true);
+
+  // 4. 设置 transition 标记（关键！）
+  const prevTransition = ReactCurrentBatchConfig.transition;
+  ReactCurrentBatchConfig.transition = {};  // 标记当前处于 transition 中
+
+  try {
+    // 5. 高优先级：设置 isPending = false（会被批量处理）
+    setPending(false);
+
+    // 6. 执行用户回调（此时 transition 标记存在）
+    callback();
+  } finally {
+    // 7. 恢复之前的优先级和 transition 状态
+    setCurrentUpdatePriority(previousPriority);
+    ReactCurrentBatchConfig.transition = prevTransition;
+  }
+}
+```
+
+**4. requestUpdateLane 如何判断 Transition 优先级**
+
+当 `setState` 被调用时，会通过 `requestUpdateLane` 获取更新优先级：
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberWorkLoop.new.js
+
+export function requestUpdateLane(fiber: Fiber): Lane {
+  const mode = fiber.mode;
+
+  // Legacy 模式始终返回 SyncLane
+  if ((mode & ConcurrentMode) === NoMode) {
+    return SyncLane;
+  }
+
+  // 🔥 关键：检查是否处于 transition 中
+  const isTransition = requestCurrentTransition() !== NoTransition;
+
+  if (isTransition) {
+    // 如果在 transition 中，分配一个 TransitionLane
+    // TransitionLane 的优先级比 SyncLane 和 DefaultLane 都低
+    return claimNextTransitionLane();
+  }
+
+  // 获取当前事件优先级
+  const updateLane: Lane = getCurrentUpdatePriority();
+  if (updateLane !== NoLane) {
+    return updateLane;
+  }
+
+  // 获取当前事件类型对应的优先级
+  const eventLane: Lane = getCurrentEventPriority();
+  return eventLane;
+}
+
+// 检查是否在 transition 中
+export function requestCurrentTransition(): Transition | null {
+  return ReactCurrentBatchConfig.transition;
+}
+```
+
+**5. claimNextTransitionLane 的实现**
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberLane.new.js
+
+// 16 个 Transition Lane，循环使用
+const TransitionLanes: Lanes = 0b0000000001111111111111111000000;
+const TransitionLane1: Lane =  0b0000000000000000000000001000000;
+// ... TransitionLane2 ~ TransitionLane16
+
+let nextTransitionLane: Lane = TransitionLane1;
+
+export function claimNextTransitionLane(): Lane {
+  // 获取当前的 transition lane
+  const lane = nextTransitionLane;
+
+  // 移动到下一个 lane
+  nextTransitionLane <<= 1;
+
+  // 如果超出 TransitionLanes 范围，循环回到 TransitionLane1
+  if ((nextTransitionLane & TransitionLanes) === 0) {
+    nextTransitionLane = TransitionLane1;
+  }
+
+  return lane;
+}
+```
+
+**6. 优先级对比图**
+
+```
+Lane 优先级（数值越小，优先级越高）：
+
+SyncLane                    0b0000000000000000000000000000001  (最高)
+InputContinuousLane         0b0000000000000000000000000000100
+DefaultLane                 0b0000000000000000000000000010000
+TransitionLane1~16          0b0000000000000000000000001000000  (较低)
+                            ~
+                            0b0000000001000000000000000000000
+RetryLanes                  0b0000111110000000000000000000000
+IdleLane                    0b0100000000000000000000000000000  (最低)
+```
+
+**7. 完整的优先级降级流程**
+
+```
+用户点击按钮
+    │
+    └─ click 事件触发
+         │
+         └─ dispatchDiscreteEvent
+              │
+              └─ 设置 currentUpdatePriority = DiscreteEventPriority (对应 SyncLane)
+                   │
+                   └─ 执行事件处理函数 handleClick
+                        │
+                        ├─ setQuery(value)  // 直接调用
+                        │    │
+                        │    └─ requestUpdateLane(fiber)
+                        │         └─ isTransition = false
+                        │         └─ 返回 SyncLane (高优先级)
+                        │
+                        └─ startTransition(() => { setResults(...) })
+                             │
+                             ├─ ReactCurrentBatchConfig.transition = {}
+                             │
+                             └─ 执行 callback: setResults(...)
+                                  │
+                                  └─ requestUpdateLane(fiber)
+                                       └─ isTransition = true ✓
+                                       └─ 返回 TransitionLane (低优先级)
+
+结果：
+- setQuery 的更新使用 SyncLane → 立即同步执行
+- setResults 的更新使用 TransitionLane → 可被中断，延迟执行
+```
+
+**8. 实际效果示例**
+
+```jsx
+function ExpensiveList({ items }) {
+  // 假设这是一个渲染很慢的列表
+  return (
+    <ul>
+      {items.map(item => (
+        <li key={item.id}>{/* 复杂计算 */}</li>
+      ))}
+    </ul>
+  );
+}
+
+function App() {
+  const [text, setText] = useState('');
+  const [list, setList] = useState([]);
+  const [isPending, startTransition] = useTransition();
+
+  const handleChange = (e) => {
+    // 输入框立即响应（SyncLane）
+    setText(e.target.value);
+
+    // 列表更新可以等待（TransitionLane）
+    startTransition(() => {
+      setList(generateItems(e.target.value));
+    });
+  };
+
+  return (
+    <div>
+      <input value={text} onChange={handleChange} />
+      {isPending ? <p>加载中...</p> : <ExpensiveList items={list} />}
+    </div>
+  );
+}
+
+// 调度过程：
+// 1. 输入 "a"，产生两个更新：
+//    - setText("a")  → SyncLane
+//    - setList(...)  → TransitionLane
+//
+// 2. React 调度器首先处理高优先级的 SyncLane 更新
+//    - 输入框立即显示 "a"
+//    - isPending = true，显示"加载中..."
+//
+// 3. 当用户继续输入 "ab" 时：
+//    - 新的 SyncLane 更新打断 TransitionLane 的渲染
+//    - 输入框立即显示 "ab"
+//    - 之前的 TransitionLane 更新被丢弃，使用新的更新
+//
+// 4. 当用户停止输入后，TransitionLane 更新完成
+//    - isPending = false
+//    - 显示最终的列表
+```
+
+---
+
+### 2.4 createFiberRoot 详解
 
 ```typescript
 // 源码位置：react-reconciler/src/ReactFiberRoot.new.js
@@ -374,7 +1813,7 @@ export function createFiberRoot(
 }
 ```
 
-### 2.4 createHostRootFiber 详解
+### 2.5 createHostRootFiber 详解
 
 ```typescript
 // 源码位置：react-reconciler/src/ReactFiber.new.js
@@ -416,7 +1855,7 @@ const createFiber = function(
 };
 ```
 
-### 2.5 render 方法详解
+### 2.6 render 方法详解
 
 ```typescript
 // 源码位置：react-dom/src/client/ReactDOMRoot.js
@@ -431,7 +1870,7 @@ ReactDOMRoot.prototype.render = function(children: ReactNodeList): void {
 };
 ```
 
-### 2.6 updateContainer 详解
+### 2.7 updateContainer 详解
 
 ```typescript
 // 源码位置：react-reconciler/src/ReactFiberReconciler.new.js
@@ -484,7 +1923,7 @@ export function updateContainer(
 }
 ```
 
-### 2.7 scheduleUpdateOnFiber 详解（调度入口）
+### 2.8 scheduleUpdateOnFiber 详解（调度入口）
 
 这是 React 更新调度的核心入口函数，无论是初始化还是后续更新都会调用它。
 
@@ -537,7 +1976,7 @@ export function scheduleUpdateOnFiber(
 }
 ```
 
-### 2.8 markUpdateLaneFromFiberToRoot 详解
+### 2.9 markUpdateLaneFromFiberToRoot 详解
 
 ```typescript
 // 源码位置：react-reconciler/src/ReactFiberWorkLoop.new.js
@@ -576,7 +2015,7 @@ function markUpdateLaneFromFiberToRoot(
 }
 ```
 
-### 2.9 ensureRootIsScheduled 详解
+### 2.10 ensureRootIsScheduled 详解
 
 ```typescript
 // 源码位置：react-reconciler/src/ReactFiberWorkLoop.new.js
@@ -666,7 +2105,7 @@ function ensureRootIsScheduled(root: FiberRoot, currentTime: number) {
 }
 ```
 
-### 2.10 初始化完成后的数据结构
+### 2.11 初始化完成后的数据结构
 
 初始化完成后，内存中的结构如下：
 
@@ -696,6 +2135,698 @@ function ensureRootIsScheduled(root: FiberRoot, currentTime: number) {
                                     │  │ child: null (待构建)│  │
                                     │  └─────────────────────┘  │
                                     └───────────────────────────┘
+```
+
+---
+
+### 2.7 Diff 算法详解（reconcileChildren）
+
+React 的 Diff 算法是其高效更新 DOM 的核心。当组件状态更新时，React 需要对比新旧虚拟 DOM 树，找出最小的变更集。
+
+#### 2.7.1 Diff 算法的基本策略
+
+React 的 Diff 算法基于三个假设进行优化，将 O(n³) 的复杂度降低到 O(n)：
+
+```
+传统 Diff 算法：O(n³) - 无法接受
+React Diff 算法：O(n)  - 基于以下三个假设
+
+假设一：跨层级的 DOM 移动操作很少
+        → 只对同层级节点进行比较
+
+假设二：不同类型的组件产生不同的树结构
+        → type 不同直接删除重建
+
+假设三：通过 key 可以标识哪些子元素在不同渲染间保持稳定
+        → key 相同的节点可以复用
+```
+
+#### 2.7.2 reconcileChildren 入口
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberBeginWork.new.js
+
+export function reconcileChildren(
+  current: Fiber | null,
+  workInProgress: Fiber,
+  nextChildren: any,      // 新的子元素（render 返回值）
+  renderLanes: Lanes,
+) {
+  if (current === null) {
+    // 首次渲染：没有旧节点需要对比
+    // mountChildFibers 不会标记 Placement（因为整个树都是新的）
+    workInProgress.child = mountChildFibers(
+      workInProgress,
+      null,           // 旧的子 Fiber 为 null
+      nextChildren,
+      renderLanes,
+    );
+  } else {
+    // 更新渲染：需要进行 diff
+    // reconcileChildFibers 会标记副作用（Placement/Deletion 等）
+    workInProgress.child = reconcileChildFibers(
+      workInProgress,
+      current.child,  // 旧的子 Fiber
+      nextChildren,   // 新的子元素
+      renderLanes,
+    );
+  }
+}
+
+// mountChildFibers 和 reconcileChildFibers 都是 ChildReconciler 的实例
+// 唯一区别是 shouldTrackSideEffects 参数
+export const reconcileChildFibers = ChildReconciler(true);   // 追踪副作用
+export const mountChildFibers = ChildReconciler(false);      // 不追踪副作用
+```
+
+#### 2.7.3 reconcileChildFibers 核心逻辑
+
+```typescript
+// 源码位置：react-reconciler/src/ReactChildFiber.new.js
+
+function reconcileChildFibers(
+  returnFiber: Fiber,         // 父 Fiber
+  currentFirstChild: Fiber | null,  // 旧的第一个子 Fiber
+  newChild: any,              // 新的子元素
+  lanes: Lanes,
+): Fiber | null {
+
+  // 1. 处理顶层无 key 的 Fragment，展开其 children
+  const isUnkeyedTopLevelFragment =
+    typeof newChild === 'object' &&
+    newChild !== null &&
+    newChild.type === REACT_FRAGMENT_TYPE &&
+    newChild.key === null;
+  if (isUnkeyedTopLevelFragment) {
+    newChild = newChild.props.children;
+  }
+
+  // 2. 根据 newChild 的类型分发处理
+  if (typeof newChild === 'object' && newChild !== null) {
+    switch (newChild.$$typeof) {
+      case REACT_ELEMENT_TYPE:
+        // 单个 React 元素
+        return placeSingleChild(
+          reconcileSingleElement(returnFiber, currentFirstChild, newChild, lanes)
+        );
+      case REACT_PORTAL_TYPE:
+        // Portal 类型
+        return placeSingleChild(
+          reconcileSinglePortal(returnFiber, currentFirstChild, newChild, lanes)
+        );
+      case REACT_LAZY_TYPE:
+        // Lazy 组件
+        const payload = newChild._payload;
+        const init = newChild._init;
+        return reconcileChildFibers(returnFiber, currentFirstChild, init(payload), lanes);
+    }
+
+    if (isArray(newChild)) {
+      // 数组类型的子元素（最常见的多子节点情况）
+      return reconcileChildrenArray(returnFiber, currentFirstChild, newChild, lanes);
+    }
+
+    if (getIteratorFn(newChild)) {
+      // 可迭代对象
+      return reconcileChildrenIterator(returnFiber, currentFirstChild, newChild, lanes);
+    }
+  }
+
+  // 3. 文本节点
+  if ((typeof newChild === 'string' && newChild !== '') || typeof newChild === 'number') {
+    return placeSingleChild(
+      reconcileSingleTextNode(returnFiber, currentFirstChild, '' + newChild, lanes)
+    );
+  }
+
+  // 4. 其他情况（null, undefined, boolean）- 删除所有旧子节点
+  return deleteRemainingChildren(returnFiber, currentFirstChild);
+}
+```
+
+#### 2.7.4 单节点 Diff（reconcileSingleElement）
+
+当新的子元素是单个 React Element 时：
+
+```typescript
+// 源码位置：react-reconciler/src/ReactChildFiber.new.js
+
+function reconcileSingleElement(
+  returnFiber: Fiber,
+  currentFirstChild: Fiber | null,
+  element: ReactElement,
+  lanes: Lanes,
+): Fiber {
+  const key = element.key;
+  let child = currentFirstChild;
+
+  // 遍历旧的子 Fiber 链表，尝试找到可复用的节点
+  while (child !== null) {
+    // 1. 首先比较 key
+    if (child.key === key) {
+      const elementType = element.type;
+
+      // 2. key 相同，再比较 type
+      if (elementType === REACT_FRAGMENT_TYPE) {
+        // Fragment 类型
+        if (child.tag === Fragment) {
+          // key 和 type 都匹配，可以复用
+          deleteRemainingChildren(returnFiber, child.sibling);  // 删除多余的兄弟节点
+          const existing = useFiber(child, element.props.children);
+          existing.return = returnFiber;
+          return existing;
+        }
+      } else {
+        // 普通元素
+        if (child.elementType === elementType) {
+          // key 和 type 都匹配，可以复用！
+          deleteRemainingChildren(returnFiber, child.sibling);  // 删除多余的兄弟节点
+          const existing = useFiber(child, element.props);       // 复用旧 Fiber
+          existing.ref = coerceRef(returnFiber, child, element);
+          existing.return = returnFiber;
+          return existing;
+        }
+      }
+      // key 相同但 type 不同，删除所有旧节点，跳出循环
+      deleteRemainingChildren(returnFiber, child);
+      break;
+    } else {
+      // key 不同，标记删除当前节点，继续查找
+      deleteChild(returnFiber, child);
+    }
+    child = child.sibling;
+  }
+
+  // 没有找到可复用的节点，创建新的 Fiber
+  if (element.type === REACT_FRAGMENT_TYPE) {
+    const created = createFiberFromFragment(
+      element.props.children,
+      returnFiber.mode,
+      lanes,
+      element.key,
+    );
+    created.return = returnFiber;
+    return created;
+  } else {
+    const created = createFiberFromElement(element, returnFiber.mode, lanes);
+    created.ref = coerceRef(returnFiber, currentFirstChild, element);
+    created.return = returnFiber;
+    return created;
+  }
+}
+```
+
+**单节点 Diff 流程图：**
+
+```
+新元素: <div key="a">Hello</div>
+旧子节点: A(key="a") -> B(key="b") -> C(key="c")
+
+Step 1: 比较 A
+        ├─ key 相同 ("a" === "a") ✓
+        └─ type 相同 (div === div) ✓
+            └─ 复用 A，删除 B 和 C
+
+结果: 复用 A
+
+---
+
+新元素: <span key="a">Hello</span>
+旧子节点: A(key="a", div) -> B(key="b") -> C(key="c")
+
+Step 1: 比较 A
+        ├─ key 相同 ("a" === "a") ✓
+        └─ type 不同 (span !== div) ✗
+            └─ 删除所有旧节点，创建新节点
+
+结果: 删除 A, B, C，创建新的 span
+
+---
+
+新元素: <div key="b">Hello</div>
+旧子节点: A(key="a") -> B(key="b") -> C(key="c")
+
+Step 1: 比较 A
+        └─ key 不同 ("b" !== "a") ✗
+            └─ 标记删除 A，继续查找
+
+Step 2: 比较 B
+        ├─ key 相同 ("b" === "b") ✓
+        └─ type 相同 (div === div) ✓
+            └─ 复用 B，删除 C
+
+结果: 删除 A 和 C，复用 B
+```
+
+#### 2.7.5 多节点 Diff（reconcileChildrenArray）
+
+当子元素是数组时，React 使用更复杂的算法来处理可能的增、删、移动操作：
+
+```typescript
+// 源码位置：react-reconciler/src/ReactChildFiber.new.js
+
+function reconcileChildrenArray(
+  returnFiber: Fiber,
+  currentFirstChild: Fiber | null,
+  newChildren: Array<*>,
+  lanes: Lanes,
+): Fiber | null {
+  let resultingFirstChild: Fiber | null = null;  // 新 Fiber 链表的头
+  let previousNewFiber: Fiber | null = null;     // 上一个新 Fiber
+
+  let oldFiber = currentFirstChild;
+  let lastPlacedIndex = 0;  // 最后一个不需要移动的旧节点索引
+  let newIdx = 0;
+  let nextOldFiber = null;
+
+  // ==================== 第一轮遍历 ====================
+  // 从左到右同时遍历新旧数组，尝试复用
+  for (; oldFiber !== null && newIdx < newChildren.length; newIdx++) {
+    if (oldFiber.index > newIdx) {
+      // 旧 Fiber 的索引大于新索引，说明有节点被删除了
+      nextOldFiber = oldFiber;
+      oldFiber = null;
+    } else {
+      nextOldFiber = oldFiber.sibling;
+    }
+
+    // 尝试复用或创建新 Fiber
+    const newFiber = updateSlot(returnFiber, oldFiber, newChildren[newIdx], lanes);
+
+    if (newFiber === null) {
+      // key 不匹配，无法继续复用，跳出第一轮循环
+      if (oldFiber === null) {
+        oldFiber = nextOldFiber;
+      }
+      break;
+    }
+
+    if (shouldTrackSideEffects) {
+      if (oldFiber && newFiber.alternate === null) {
+        // 匹配到 slot 但没有复用（type 变了），删除旧节点
+        deleteChild(returnFiber, oldFiber);
+      }
+    }
+
+    // 判断节点是否需要移动
+    lastPlacedIndex = placeChild(newFiber, lastPlacedIndex, newIdx);
+
+    // 构建新 Fiber 链表
+    if (previousNewFiber === null) {
+      resultingFirstChild = newFiber;
+    } else {
+      previousNewFiber.sibling = newFiber;
+    }
+    previousNewFiber = newFiber;
+    oldFiber = nextOldFiber;
+  }
+
+  // ==================== 第一轮结束后的情况 ====================
+
+  // 情况1: 新数组遍历完了，删除剩余的旧节点
+  if (newIdx === newChildren.length) {
+    deleteRemainingChildren(returnFiber, oldFiber);
+    return resultingFirstChild;
+  }
+
+  // 情况2: 旧链表遍历完了，剩余的新节点都是插入
+  if (oldFiber === null) {
+    for (; newIdx < newChildren.length; newIdx++) {
+      const newFiber = createChild(returnFiber, newChildren[newIdx], lanes);
+      if (newFiber === null) continue;
+      lastPlacedIndex = placeChild(newFiber, lastPlacedIndex, newIdx);
+      if (previousNewFiber === null) {
+        resultingFirstChild = newFiber;
+      } else {
+        previousNewFiber.sibling = newFiber;
+      }
+      previousNewFiber = newFiber;
+    }
+    return resultingFirstChild;
+  }
+
+  // ==================== 第二轮遍历 ====================
+  // 情况3: 新旧数组都没遍历完，需要处理移动的情况
+
+  // 将剩余的旧节点放入 Map 中，以 key（或 index）为键
+  const existingChildren = mapRemainingChildren(returnFiber, oldFiber);
+
+  // 遍历剩余的新节点
+  for (; newIdx < newChildren.length; newIdx++) {
+    // 从 Map 中查找可复用的旧节点
+    const newFiber = updateFromMap(
+      existingChildren,
+      returnFiber,
+      newIdx,
+      newChildren[newIdx],
+      lanes,
+    );
+
+    if (newFiber !== null) {
+      if (shouldTrackSideEffects) {
+        if (newFiber.alternate !== null) {
+          // 复用了旧节点，从 Map 中移除
+          existingChildren.delete(newFiber.key === null ? newIdx : newFiber.key);
+        }
+      }
+      // 判断是否需要移动
+      lastPlacedIndex = placeChild(newFiber, lastPlacedIndex, newIdx);
+      if (previousNewFiber === null) {
+        resultingFirstChild = newFiber;
+      } else {
+        previousNewFiber.sibling = newFiber;
+      }
+      previousNewFiber = newFiber;
+    }
+  }
+
+  // 删除 Map 中剩余的旧节点（它们在新数组中不存在）
+  if (shouldTrackSideEffects) {
+    existingChildren.forEach(child => deleteChild(returnFiber, child));
+  }
+
+  return resultingFirstChild;
+}
+```
+
+#### 2.7.6 节点移动判断（placeChild）
+
+```typescript
+function placeChild(
+  newFiber: Fiber,
+  lastPlacedIndex: number,
+  newIndex: number,
+): number {
+  newFiber.index = newIndex;
+
+  if (!shouldTrackSideEffects) {
+    newFiber.flags |= Forked;
+    return lastPlacedIndex;
+  }
+
+  const current = newFiber.alternate;
+  if (current !== null) {
+    const oldIndex = current.index;
+    if (oldIndex < lastPlacedIndex) {
+      // 旧索引 < lastPlacedIndex，说明这个节点需要向右移动
+      // 标记为需要 Placement
+      newFiber.flags |= Placement;
+      return lastPlacedIndex;
+    } else {
+      // 不需要移动，更新 lastPlacedIndex
+      return oldIndex;
+    }
+  } else {
+    // 新节点（没有 alternate），需要插入
+    newFiber.flags |= Placement;
+    return lastPlacedIndex;
+  }
+}
+```
+
+**移动判断的核心思想：**
+
+```
+核心原则：参照物是最后一个不需要移动的节点的旧索引（lastPlacedIndex）
+
+如果当前节点的旧索引 < lastPlacedIndex，说明它原本在参照物的左边，
+但现在需要移动到参照物的右边，所以标记为需要移动。
+
+示例：
+旧: A(0) B(1) C(2) D(3)
+新: A    C    D    B
+
+遍历过程：
+1. A: oldIndex=0, lastPlacedIndex=0
+      oldIndex(0) >= lastPlacedIndex(0) ✓ 不移动
+      lastPlacedIndex = 0
+
+2. C: oldIndex=2, lastPlacedIndex=0
+      oldIndex(2) >= lastPlacedIndex(0) ✓ 不移动
+      lastPlacedIndex = 2
+
+3. D: oldIndex=3, lastPlacedIndex=2
+      oldIndex(3) >= lastPlacedIndex(2) ✓ 不移动
+      lastPlacedIndex = 3
+
+4. B: oldIndex=1, lastPlacedIndex=3
+      oldIndex(1) < lastPlacedIndex(3) ✗ 需要移动！
+      标记 B 为 Placement
+
+结果：只需要移动 B 到最后
+```
+
+#### 2.7.7 多节点 Diff 完整示例
+
+```
+示例1：节点更新（无增删移动）
+旧: A(key=a) -> B(key=b) -> C(key=c)
+新: [A', B', C']  (内容更新，key不变)
+
+第一轮遍历：
+  A: key 匹配，type 匹配 → 复用
+  B: key 匹配，type 匹配 → 复用
+  C: key 匹配，type 匹配 → 复用
+结果: 全部复用，只更新 props
+
+---
+
+示例2：节点删除
+旧: A -> B -> C -> D
+新: [A, C]
+
+第一轮遍历：
+  A: 复用
+  C: key="c" !== oldFiber(B).key="b" → 跳出循环
+第二轮遍历（Map）：
+  C: 从 Map 中找到 C → 复用
+剩余旧节点 B, D 被删除
+
+---
+
+示例3：节点新增
+旧: A -> B
+新: [A, B, C, D]
+
+第一轮遍历：
+  A: 复用
+  B: 复用
+oldFiber === null，进入情况2
+剩余新节点 C, D 全部创建插入
+
+---
+
+示例4：节点移动
+旧: A(0) -> B(1) -> C(2) -> D(3)
+新: [D, A, B, C]
+
+第一轮遍历：
+  D: key="d" !== oldFiber(A).key="a" → 跳出循环
+
+第二轮遍历（Map）：
+  existingChildren = {a: A, b: B, c: C, d: D}
+
+  D: oldIndex=3, lastPlacedIndex=0 → 3 >= 0 → 不移动, lastPlacedIndex=3
+  A: oldIndex=0, lastPlacedIndex=3 → 0 < 3  → 移动！
+  B: oldIndex=1, lastPlacedIndex=3 → 1 < 3  → 移动！
+  C: oldIndex=2, lastPlacedIndex=3 → 2 < 3  → 移动！
+
+结果: D 不动，A、B、C 依次移动到 D 后面
+实际 DOM 操作: 3 次移动
+```
+
+#### 2.7.8 不同类型组件的 Diff 处理
+
+在 `beginWork` 阶段，不同类型的组件有不同的处理方式：
+
+**1. 函数组件（FunctionComponent）**
+
+```typescript
+function updateFunctionComponent(
+  current, workInProgress, Component, nextProps, renderLanes
+) {
+  // 1. 执行函数组件，获取新的子元素
+  let nextChildren = renderWithHooks(
+    current,
+    workInProgress,
+    Component,
+    nextProps,
+    context,
+    renderLanes,
+  );
+
+  // 2. 检查是否可以 bailout（跳过更新）
+  if (current !== null && !didReceiveUpdate) {
+    bailoutHooks(current, workInProgress, renderLanes);
+    return bailoutOnAlreadyFinishedWork(current, workInProgress, renderLanes);
+  }
+
+  // 3. 协调子节点
+  reconcileChildren(current, workInProgress, nextChildren, renderLanes);
+  return workInProgress.child;
+}
+```
+
+**2. 类组件（ClassComponent）**
+
+```typescript
+function updateClassComponent(
+  current, workInProgress, Component, nextProps, renderLanes
+) {
+  // 1. 获取或创建实例
+  const instance = workInProgress.stateNode;
+
+  // 2. 调用生命周期方法，判断是否需要更新
+  const shouldUpdate = checkShouldComponentUpdate(
+    workInProgress,
+    Component,
+    oldProps,
+    newProps,
+    oldState,
+    newState,
+    nextContext,
+  );
+
+  if (shouldUpdate) {
+    // 3. 调用 render 方法获取新的子元素
+    nextChildren = instance.render();
+  }
+
+  // 4. 协调子节点
+  reconcileChildren(current, workInProgress, nextChildren, renderLanes);
+  return workInProgress.child;
+}
+```
+
+**3. 原生 DOM 组件（HostComponent）**
+
+```typescript
+function updateHostComponent(current, workInProgress, renderLanes) {
+  const type = workInProgress.type;
+  const nextProps = workInProgress.pendingProps;
+
+  // 1. 获取子元素
+  let nextChildren = nextProps.children;
+
+  // 2. 特殊处理：如果只有文本子节点，直接设置文本内容
+  const isDirectTextChild = shouldSetTextContent(type, nextProps);
+  if (isDirectTextChild) {
+    // 不创建 HostText Fiber，直接在 DOM 节点上设置文本
+    nextChildren = null;
+  }
+
+  // 3. 标记 ref
+  markRef(current, workInProgress);
+
+  // 4. 协调子节点
+  reconcileChildren(current, workInProgress, nextChildren, renderLanes);
+  return workInProgress.child;
+}
+```
+
+**4. Memo 组件（MemoComponent）**
+
+```typescript
+function updateMemoComponent(
+  current, workInProgress, Component, nextProps, renderLanes
+) {
+  if (current !== null) {
+    const prevProps = current.memoizedProps;
+
+    // 使用 compare 函数（默认是 shallowEqual）比较 props
+    if (shallowEqual(prevProps, nextProps) && current.ref === workInProgress.ref) {
+      // props 没变，跳过更新
+      didReceiveUpdate = false;
+      // ... bailout 逻辑
+    }
+  }
+
+  // props 变了或首次渲染，走正常更新流程
+  return updateSimpleMemoComponent(/*...*/);
+}
+```
+
+#### 2.7.9 Diff 算法流程图总结
+
+```
+reconcileChildFibers(returnFiber, currentFirstChild, newChild, lanes)
+                │
+                ├─ newChild 是单个元素？
+                │       │
+                │       └─ reconcileSingleElement
+                │              │
+                │              └─ 遍历旧 Fiber 链表
+                │                    │
+                │                    ├─ key 相同 && type 相同 → 复用
+                │                    ├─ key 相同 && type 不同 → 删除所有，创建新的
+                │                    └─ key 不同 → 删除当前，继续查找
+                │
+                ├─ newChild 是数组？
+                │       │
+                │       └─ reconcileChildrenArray
+                │              │
+                │              ├─ 第一轮：从左到右遍历
+                │              │     ├─ key 匹配 → 复用/更新
+                │              │     └─ key 不匹配 → 跳出循环
+                │              │
+                │              ├─ 新数组遍历完 → 删除剩余旧节点
+                │              │
+                │              ├─ 旧链表遍历完 → 插入剩余新节点
+                │              │
+                │              └─ 第二轮：Map 查找
+                │                    ├─ 构建 existingChildren Map
+                │                    ├─ 遍历剩余新节点
+                │                    │     └─ 从 Map 中查找可复用节点
+                │                    └─ 删除 Map 中剩余的旧节点
+                │
+                └─ newChild 是文本？
+                        │
+                        └─ reconcileSingleTextNode
+```
+
+#### 2.7.10 Diff 算法的注意事项与最佳实践
+
+**1. key 的重要性**
+
+```jsx
+// ❌ 错误：使用 index 作为 key
+{items.map((item, index) => (
+  <Item key={index} data={item} />
+))}
+// 问题：当列表顺序变化时，React 会错误地复用节点，导致状态混乱
+
+// ✅ 正确：使用稳定且唯一的 id
+{items.map(item => (
+  <Item key={item.id} data={item} />
+))}
+```
+
+**2. 避免不必要的节点类型变化**
+
+```jsx
+// ❌ 类型变化会导致整个子树重建
+{isLoggedIn ? <UserPanel /> : <LoginForm />}
+
+// ✅ 如果结构相似，考虑使用同一组件
+<AuthPanel isLoggedIn={isLoggedIn} />
+```
+
+**3. 列表操作的优化**
+
+```
+在列表头部插入：
+旧: B -> C -> D
+新: A -> B -> C -> D
+
+React 的处理：
+第一轮：A.key !== B.key → 跳出
+第二轮：A 是新增，B/C/D 从 Map 中找到并复用
+       但 B/C/D 的 oldIndex 都 < lastPlacedIndex(新插入的A没有oldIndex)
+       所以 B/C/D 都被标记为移动！
+
+优化建议：
+- 频繁在头部插入的场景，考虑使用反转数组
+- 或者使用虚拟列表只渲染可见项
 ```
 
 ---
