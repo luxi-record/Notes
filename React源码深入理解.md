@@ -37,6 +37,24 @@
     - [2.7.10 Diff 算法的注意事项与最佳实践](#2710-diff-算法的注意事项与最佳实践)
 - [第三部分：更新流程（setState）](#第三部分更新流程setstate)
 - [第四部分：调度机制（Scheduler）](#第四部分调度机制scheduler)
+  - [4.0 Scheduler 与 React 的关系](#40-scheduler-与-react-的关系)
+  - [4.1 Scheduler 核心概念](#41-scheduler-核心概念)
+  - [4.2 小顶堆实现](#42-小顶堆实现)
+  - [4.3 scheduleCallback 详解](#43-schedulecallback-详解)
+  - [4.4 requestHostCallback 详解](#44-requesthostcallback-详解)
+  - [4.5 performWorkUntilDeadline 详解](#45-performworkuntildeadline-详解)
+  - [4.6 workLoop 详解](#46-workloop-详解)
+  - [4.7 shouldYieldToHost 详解](#47-shouldyieldtohost-详解)
+  - [4.8 Scheduler 与 React 的连接](#48-scheduler-与-react-的连接)
+  - [4.9 React 如何调度多个 setState](#49-react-如何调度多个-setstate)
+    - [4.9.1 同步场景下的批量更新](#491-同步场景下的批量更新)
+    - [4.9.2 ensureRootIsScheduled 的去重机制](#492-ensurerootisscheduled-的去重机制)
+    - [4.9.3 不同优先级的 setState](#493-不同优先级的-setstate)
+    - [4.9.4 高优先级打断低优先级](#494-高优先级打断低优先级)
+    - [4.9.5 为什么要从头开始而不是从中断点恢复](#495-为什么要从头开始而不是从中断点恢复)
+  - [4.10 时间切片的实现细节](#410-时间切片的实现细节)
+  - [4.11 任务饿死的防止机制](#411-任务饿死的防止机制)
+  - [4.12 调度流程完整图解](#412-调度流程完整图解)
 - [第五部分：完整调用链总结](#第五部分完整调用链总结)
 
 ---
@@ -956,6 +974,7 @@ function dispatchEvent(
   nativeEvent: AnyNativeEvent,
 ) {
   // 找到触发事件的 DOM 和对应的 Fiber
+  // 如果是hydration，点击之前未hydration完成会阻塞，当hydration完成后再重启
   let blockedOn = findInstanceBlockingEvent(
     domEventName,
     eventSystemFlags,
@@ -3529,7 +3548,37 @@ function commitRootImpl(
 
 ## 第四部分：调度机制（Scheduler）
 
-Scheduler 是 React 的任务调度器，负责管理任务的优先级和执行时机。
+Scheduler 是一个**独立于 React 的通用任务调度库**，React 通过它来实现任务的优先级调度和时间切片。
+
+### 4.0 Scheduler 与 React 的关系
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Scheduler（独立的包）                              │
+│                                                                         │
+│   • 不依赖 React，可以单独使用                                            │
+│   • 负责任务的调度、优先级管理、时间切片                                    │
+│   • 使用小顶堆管理任务队列                                                │
+│   • 通过 MessageChannel/setTimeout 实现宏任务调度                         │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ▲
+                                    │ scheduleCallback(priority, callback)
+                                    │
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        React Reconciler                                  │
+│                                                                         │
+│   • 将 Lane 优先级转换为 Scheduler 优先级                                 │
+│   • 将 performConcurrentWorkOnRoot 作为 callback 传给 Scheduler          │
+│   • Scheduler 回调执行时，React 开始 render/commit 工作                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**为什么要独立？**
+1. 关注点分离：Scheduler 专注于"何时执行"，React 专注于"执行什么"
+2. 可复用性：其他框架也可以使用 Scheduler
+3. 可测试性：可以独立测试调度逻辑
 
 ### 4.1 Scheduler 核心概念
 
@@ -3999,6 +4048,505 @@ function ensureRootIsScheduled(root, currentTime) {
     performConcurrentWorkOnRoot.bind(null, root),
   );
 }
+```
+
+### 4.9 React 如何调度多个 setState
+
+当多个 `setState` 同时触发时，React 的调度逻辑如下：
+
+#### 4.9.1 同步场景下的批量更新
+
+```jsx
+function handleClick() {
+  setState1(1);  // 触发更新
+  setState2(2);  // 触发更新
+  setState3(3);  // 触发更新
+}
+// 这三个 setState 会被合并为一次更新
+```
+
+**流程解析：**
+
+```
+handleClick 执行
+         │
+         ├─ setState1(1)
+         │       │
+         │       ├─ dispatchSetState(fiber, queue, action)
+         │       │       │
+         │       │       ├─ requestUpdateLane() → SyncLane
+         │       │       ├─ 创建 Update 对象，加入 queue
+         │       │       └─ scheduleUpdateOnFiber(fiber, SyncLane)
+         │       │               │
+         │       │               ├─ markUpdateLaneFromFiberToRoot()
+         │       │               │     // 向上标记 lane 到 root
+         │       │               │
+         │       │               └─ ensureRootIsScheduled(root)
+         │       │                       │
+         │       │                       ├─ 首次：注册 flushSyncCallbacks 到微任务
+         │       │                       │        scheduleMicrotask(flushSyncCallbacks)
+         │       │                       │
+         │       │                       └─ root.callbackPriority = SyncLane
+         │       │
+         ├─ setState2(2)
+         │       │
+         │       └─ ... 同上流程 ...
+         │               │
+         │               └─ ensureRootIsScheduled(root)
+         │                       │
+         │                       └─ 🔥 关键判断：
+         │                          existingCallbackPriority === newCallbackPriority
+         │                          (SyncLane === SyncLane) → true
+         │                          直接 return，复用之前的任务！
+         │
+         └─ setState3(3) → 同上，也复用之前的任务
+
+handleClick 执行完毕
+         │
+         ▼
+微任务执行：flushSyncCallbacks()
+         │
+         └─ 执行 performSyncWorkOnRoot(root)
+                 │
+                 └─ 一次性处理所有 3 个 Update
+```
+
+#### 4.9.2 ensureRootIsScheduled 的去重机制
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberWorkLoop.new.js
+
+function ensureRootIsScheduled(root: FiberRoot, currentTime: number) {
+  const existingCallbackNode = root.callbackNode;
+
+  // ... 省略过期任务处理 ...
+
+  const nextLanes = getNextLanes(root, workInProgressRootRenderLanes);
+
+  if (nextLanes === NoLanes) {
+    // 没有任务了
+    root.callbackNode = null;
+    root.callbackPriority = NoLane;
+    return;
+  }
+
+  const newCallbackPriority = getHighestPriorityLane(nextLanes);
+  const existingCallbackPriority = root.callbackPriority;
+
+  // 🔥🔥🔥 关键：优先级相同时，复用现有任务
+  if (existingCallbackPriority === newCallbackPriority) {
+    // 优先级没变，不需要重新调度，直接复用现有任务
+    return;
+  }
+
+  // 优先级变了（新的更高）
+  if (existingCallbackNode != null) {
+    // 取消旧任务
+    cancelCallback(existingCallbackNode);
+  }
+
+  // 注册新任务
+  let newCallbackNode;
+  if (newCallbackPriority === SyncLane) {
+    // 同步优先级：通过微任务调度
+    scheduleSyncCallback(performSyncWorkOnRoot.bind(null, root));
+    scheduleMicrotask(flushSyncCallbacks);
+    newCallbackNode = null;
+  } else {
+    // 其他优先级：通过 Scheduler 调度
+    newCallbackNode = scheduleCallback(
+      schedulerPriorityLevel,
+      performConcurrentWorkOnRoot.bind(null, root),
+    );
+  }
+
+  root.callbackPriority = newCallbackPriority;
+  root.callbackNode = newCallbackNode;
+}
+```
+
+#### 4.9.3 不同优先级的 setState
+
+```jsx
+function handleClick() {
+  // 高优先级（点击事件中，SyncLane）
+  setCount(1);
+
+  // 低优先级（useTransition 包裹）
+  startTransition(() => {
+    setList(newList);
+  });
+}
+```
+
+**流程解析：**
+
+```
+handleClick 执行
+         │
+         ├─ setCount(1)
+         │       │
+         │       └─ requestUpdateLane() → SyncLane (高优先级)
+         │               │
+         │               └─ scheduleUpdateOnFiber → ensureRootIsScheduled
+         │                       │
+         │                       └─ 注册 SyncLane 任务
+         │                          root.callbackPriority = SyncLane
+         │
+         └─ startTransition(() => setList(newList))
+                 │
+                 ├─ ReactCurrentBatchConfig.transition = {}
+                 │
+                 └─ setList(newList)
+                         │
+                         └─ requestUpdateLane() → TransitionLane (低优先级)
+                                 │
+                                 └─ scheduleUpdateOnFiber → ensureRootIsScheduled
+                                         │
+                                         └─ existingCallbackPriority(Sync) !== newCallbackPriority(Transition)
+                                            由于 Sync > Transition，不取消现有任务
+                                            Transition 更新会在 Sync 任务完成后再处理
+
+微任务执行
+         │
+         └─ flushSyncCallbacks() → performSyncWorkOnRoot
+                 │
+                 ├─ 处理 SyncLane 的 setCount 更新
+                 │
+                 └─ render + commit 完成后
+                         │
+                         └─ ensureRootIsScheduled(root)
+                                 │
+                                 └─ 检测到还有 TransitionLane 待处理
+                                    注册新的 Scheduler 任务
+```
+
+#### 4.9.4 高优先级打断低优先级
+
+```jsx
+// 场景：低优先级任务正在执行时，用户触发高优先级更新
+
+function App() {
+  const [list, setList] = useState([]);
+  const [count, setCount] = useState(0);
+
+  // 低优先级更新（渲染大列表）
+  useEffect(() => {
+    startTransition(() => {
+      setList(generateLargeList());  // TransitionLane
+    });
+  }, []);
+
+  // 高优先级更新（用户点击）
+  const handleClick = () => {
+    setCount(c => c + 1);  // SyncLane
+  };
+}
+```
+
+**打断与恢复流程：**
+
+```
+1. Transition 更新开始执行
+         │
+         └─ performConcurrentWorkOnRoot(root)
+                 │
+                 └─ renderRootConcurrent(root, TransitionLanes)
+                         │
+                         └─ workLoopConcurrent()
+                                 │
+                                 ├─ beginWork(fiber1) ✓
+                                 ├─ beginWork(fiber2) ✓
+                                 ├─ beginWork(fiber3) ✓
+                                 │
+                                 └─ 用户点击！触发高优先级更新
+
+2. 高优先级更新调度
+         │
+         └─ dispatchSetState → scheduleUpdateOnFiber
+                 │
+                 └─ ensureRootIsScheduled(root)
+                         │
+                         ├─ newCallbackPriority = SyncLane
+                         ├─ existingCallbackPriority = TransitionLane
+                         │
+                         └─ SyncLane > TransitionLane
+                            取消现有的 Transition 任务
+                            注册新的 Sync 任务
+
+3. Scheduler workLoop 检测到时间片用完或被打断
+         │
+         └─ shouldYieldToHost() → true
+                 │
+                 └─ workLoopConcurrent 跳出循环
+                         │
+                         └─ performConcurrentWorkOnRoot 返回 continuation
+                            return performConcurrentWorkOnRoot.bind(null, root)
+                            // 但这个 continuation 不会被执行，因为任务被取消了
+
+4. 高优先级任务执行
+         │
+         └─ flushSyncCallbacks() → performSyncWorkOnRoot
+                 │
+                 └─ renderRootSync() + commitRoot()
+                         │
+                         └─ 高优先级更新完成
+
+5. 低优先级任务恢复
+         │
+         └─ ensureRootIsScheduled(root) [在 commit 结束后调用]
+                 │
+                 └─ 检测到还有 TransitionLanes 待处理
+                         │
+                         └─ 重新注册 Scheduler 任务
+                            performConcurrentWorkOnRoot.bind(null, root)
+
+6. Transition 更新重新开始
+         │
+         └─ performConcurrentWorkOnRoot(root)
+                 │
+                 └─ 🔥 从头开始 render（不是从中断点恢复）
+                    prepareFreshStack(root, lanes) // 重置 workInProgress
+```
+
+#### 4.9.5 为什么要从头开始而不是从中断点恢复？
+
+```
+原因：高优先级更新可能改变了状态
+
+假设场景：
+  - Transition 更新基于 state = {count: 0} 渲染
+  - 高优先级更新把 state 改成 {count: 1}
+  - Transition 已经渲染了一部分节点（基于旧 state）
+
+如果从中断点恢复：
+  - 前半部分基于 count: 0 渲染 ❌
+  - 后半部分基于 count: 1 渲染 ❌
+  - 结果不一致！
+
+所以必须从头开始：
+  - 整个 Transition 更新基于最新的 count: 1 渲染 ✓
+  - 结果一致！
+
+这就是为什么 React 使用 workInProgress 树而不是直接修改 current 树
+workInProgress 树可以被丢弃，从头重建
+```
+
+### 4.10 时间切片的实现细节
+
+#### 4.10.1 为什么使用 MessageChannel 而不是 setTimeout？
+
+```typescript
+// setTimeout 的问题：最小延迟 4ms（嵌套调用时）
+setTimeout(callback, 0);  // 实际延迟 4ms+
+
+// MessageChannel 没有这个限制
+const channel = new MessageChannel();
+channel.port1.onmessage = callback;
+channel.port2.postMessage(null);  // 几乎立即触发
+
+// 对于 60fps 的目标（16.6ms 一帧）
+// 4ms 的延迟意味着丢失 25% 的时间！
+```
+
+#### 4.10.2 时间切片的默认时长
+
+```typescript
+let frameInterval = 5;  // 默认 5ms
+
+// 每个时间切片执行 5ms 的工作，然后让出控制权
+// 这样浏览器有足够时间处理：
+// - 用户输入
+// - 动画
+// - 布局和绘制
+```
+
+#### 4.10.3 workLoopConcurrent vs workLoopSync
+
+```typescript
+// 同步版本：不可中断
+function workLoopSync() {
+  while (workInProgress !== null) {
+    performUnitOfWork(workInProgress);
+    // 不检查是否需要让出，一直执行到完成
+  }
+}
+
+// 并发版本：可中断
+function workLoopConcurrent() {
+  while (workInProgress !== null && !shouldYieldToHost()) {
+    performUnitOfWork(workInProgress);
+    // 每次循环都检查是否需要让出
+  }
+}
+
+// shouldYieldToHost 的判断
+function shouldYieldToHost() {
+  const timeElapsed = getCurrentTime() - startTime;
+
+  if (timeElapsed < frameInterval) {  // 5ms
+    // 时间片没用完，继续执行
+    return false;
+  }
+
+  // 时间片用完了
+  // 检查是否有用户输入等待处理
+  if (isInputPending !== null) {
+    return isInputPending();  // 使用 navigator.scheduling.isInputPending
+  }
+
+  return true;  // 让出控制权
+}
+```
+
+### 4.11 任务饿死的防止机制
+
+#### 4.11.1 过期时间机制
+
+```typescript
+// 每个优先级对应不同的超时时间
+var IMMEDIATE_PRIORITY_TIMEOUT = -1;          // 立即过期
+var USER_BLOCKING_PRIORITY_TIMEOUT = 250;     // 250ms 后过期
+var NORMAL_PRIORITY_TIMEOUT = 5000;           // 5s 后过期
+var LOW_PRIORITY_TIMEOUT = 10000;             // 10s 后过期
+var IDLE_PRIORITY_TIMEOUT = maxSigned31BitInt; // 永不过期
+
+// 任务创建时计算过期时间
+expirationTime = startTime + timeout;
+```
+
+#### 4.11.2 过期任务的同步执行
+
+```typescript
+// 源码位置：react-reconciler/src/ReactFiberWorkLoop.new.js
+
+function ensureRootIsScheduled(root, currentTime) {
+  // 检查是否有任务已过期（饿死）
+  markStarvedLanesAsExpired(root, currentTime);
+  // ...
+}
+
+// 源码位置：react-reconciler/src/ReactFiberLane.new.js
+export function markStarvedLanesAsExpired(root, currentTime) {
+  const pendingLanes = root.pendingLanes;
+  const expirationTimes = root.expirationTimes;
+
+  let lanes = pendingLanes;
+  while (lanes > 0) {
+    const index = pickArbitraryLaneIndex(lanes);
+    const lane = 1 << index;
+    const expirationTime = expirationTimes[index];
+
+    if (expirationTime === NoTimestamp) {
+      // 还没设置过期时间，设置一个
+      expirationTimes[index] = computeExpirationTime(lane, currentTime);
+    } else if (expirationTime <= currentTime) {
+      // 🔥 已过期！标记到 expiredLanes
+      root.expiredLanes |= lane;
+    }
+
+    lanes &= ~lane;
+  }
+}
+
+// performConcurrentWorkOnRoot 中的判断
+const shouldTimeSlice =
+  !includesBlockingLane(root, lanes) &&
+  !includesExpiredLane(root, lanes) &&  // 🔥 如果有过期任务
+  !didTimeout;
+
+if (shouldTimeSlice) {
+  renderRootConcurrent(root, lanes);  // 可中断
+} else {
+  renderRootSync(root, lanes);         // 🔥 同步执行，不可中断
+}
+```
+
+### 4.12 调度流程完整图解
+
+```
+setState/dispatchSetState
+         │
+         ▼
+requestUpdateLane(fiber) ────────────────────────────────┐
+         │                                                │
+         │  判断优先级：                                    │
+         │  - 事件上下文？ → DiscreteEventPriority         │
+         │  - Transition？ → TransitionLane               │
+         │  - 默认 → DefaultLane                          │
+         │                                                │
+         ▼                                                │
+scheduleUpdateOnFiber(fiber, lane)                        │
+         │                                                │
+         ├─ markUpdateLaneFromFiberToRoot()               │
+         │     // 向上遍历，在每个 fiber.lanes 标记 lane   │
+         │     // 在每个 fiber.childLanes 标记 lane       │
+         │     // 直到 root.pendingLanes |= lane          │
+         │                                                │
+         └─ ensureRootIsScheduled(root, currentTime)      │
+                 │                                        │
+                 ├─ markStarvedLanesAsExpired() // 防饿死   │
+                 │                                        │
+                 ├─ getNextLanes() // 获取最高优先级 lanes  │
+                 │                                        │
+                 ├─ 去重检查：                             │
+                 │   existingCallbackPriority === newPriority?
+                 │   │                                    │
+                 │   ├─ 是 → return（复用现有任务）        │
+                 │   │                                    │
+                 │   └─ 否 → 取消旧任务，创建新任务        │
+                 │                                        │
+                 └─ 创建调度任务：                         │
+                     │                                    │
+                     ├─ SyncLane?                         │
+                     │   └─ scheduleMicrotask(flushSyncCallbacks)
+                     │                                    │
+                     └─ 其他 Lane?                        │
+                         └─ scheduleCallback(             │
+                              priority,                   │
+                              performConcurrentWorkOnRoot │
+                            )                             │
+                                                          │
+┌─────────────────────────────────────────────────────────┘
+│  Scheduler 调度层
+│
+▼
+scheduleCallback(priority, callback)
+         │
+         ├─ 计算 expirationTime = now + timeout
+         │
+         ├─ 创建 task = { callback, expirationTime, ... }
+         │
+         ├─ push(taskQueue, task)  // 小顶堆
+         │
+         └─ requestHostCallback(flushWork)
+                 │
+                 └─ schedulePerformWorkUntilDeadline()
+                         │
+                         └─ MessageChannel.postMessage()
+                                 │
+                                 ▼
+                         [下一个宏任务]
+                                 │
+                                 ▼
+                   performWorkUntilDeadline()
+                                 │
+                                 └─ flushWork()
+                                         │
+                                         └─ workLoop()
+                                                 │
+                                                 └─ while (task && !shouldYield)
+                                                         │
+                                                         ├─ task.callback()
+                                                         │   // = performConcurrentWorkOnRoot
+                                                         │
+                                                         └─ 返回值？
+                                                             │
+                                                             ├─ function → task.callback = 返回值
+                                                             │              (任务未完成，继续调度)
+                                                             │
+                                                             └─ null → pop(taskQueue)
+                                                                        (任务完成)
 ```
 
 ---
