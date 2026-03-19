@@ -3670,7 +3670,7 @@ export function pop(heap: Heap): Node | null {
 function siftUp(heap, node, i) {
   let index = i;
   while (index > 0) {
-    const parentIndex = (index - 1) >>> 1;  // 父节点索引
+    const parentIndex = (index - 1) >>> 1;  // 父节点索引 Math.floor(n / 2)
     const parent = heap[parentIndex];
     if (compare(parent, node) > 0) {
       // 父节点更大，交换
@@ -3689,9 +3689,9 @@ function siftDown(heap, node, i) {
   const length = heap.length;
   const halfLength = length >>> 1;
   while (index < halfLength) {
-    const leftIndex = (index + 1) * 2 - 1;
+    const leftIndex = (index + 1) * 2 - 1; // 2n + 1
     const left = heap[leftIndex];
-    const rightIndex = leftIndex + 1;
+    const rightIndex = leftIndex + 1; // 2n + 2
     const right = heap[rightIndex];
 
     if (compare(left, node) < 0) {
